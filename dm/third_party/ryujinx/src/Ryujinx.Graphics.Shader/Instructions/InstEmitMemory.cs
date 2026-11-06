@@ -209,7 +209,9 @@ namespace Ryujinx.Graphics.Shader.Instructions
             Operand lblRetry = Label();
             context.MarkLabel(lblRetry);
 
-            Operand expected = context.Load(storageKind, e0, e1);
+            // The word is read with an atomic (add 0), not a plain load: SPIRV-Cross writes a plain device read, which the Metal compiler may keep in a register across the retries, so after
+            // a lost race the loop compared against the same stale value forever (21d9f83e6027c565, Ocarina of Time's probe sum, hung the GPU on an M1 Pro: kIOGPUCommandBufferCallbackErrorHang)
+            Operand expected = context.AtomicAdd(storageKind, e0, e1, Const(0));
             // .FTZ: denormal inputs and the result flush to zero, as the Switch's RED / ATOMG .ADD.F32.FTZ.RN does
             Operand sum = FlushDenormal(context, context.FPAdd(FlushDenormal(context, expected), FlushDenormal(context, value)));
             Operand found = context.AtomicCompareAndSwap(storageKind, e0, e1, expected, sum);
