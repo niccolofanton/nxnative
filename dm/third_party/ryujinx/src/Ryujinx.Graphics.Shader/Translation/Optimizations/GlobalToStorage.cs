@@ -957,7 +957,8 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                     Operand lblLoopHead = Label();
                     context.MarkLabel(lblLoopHead);
 
-                    Operand oldValue = context.Load(StorageKind.GlobalMemory, hostLow, hostHigh);
+                    // nxnative: an atomic read (add 0) on every retry, not a plain load the Metal compiler may keep in a register: a stale value livelocks the CAS loop on Apple GPUs
+                    Operand oldValue = context.AtomicAdd(StorageKind.GlobalMemory, hostLow, hostHigh, Const(0));
                     Operand newValue = context.BitfieldInsert(oldValue, value, bitOffset, Const(bitSize));
                     Operand casResult = context.AtomicCompareAndSwap(StorageKind.GlobalMemory, hostLow, hostHigh, oldValue, newValue);
 
@@ -1201,7 +1202,8 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             context.MarkLabel(lblLoopHead);
 
-            Operand oldValue = context.Load(StorageKind.StorageBuffer, binding, Const(0), wordOffset);
+            // nxnative: an atomic read (add 0) on every retry, not a plain load the Metal compiler may keep in a register: a stale value livelocks the CAS loop on Apple GPUs
+            Operand oldValue = context.AtomicAdd(StorageKind.StorageBuffer, binding, Const(0), wordOffset, Const(0));
             Operand newValue = opCallback(oldValue);
 
             Operand casResult = context.AtomicCompareAndSwap(

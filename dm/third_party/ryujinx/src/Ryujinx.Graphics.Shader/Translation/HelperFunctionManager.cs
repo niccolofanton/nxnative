@@ -535,7 +535,8 @@ namespace Ryujinx.Graphics.Shader.Translation
 
             context.MarkLabel(lblLoopHead);
 
-            Operand oldValue = context.Load(StorageKind.SharedMemory, id, wordOffset);
+            // nxnative: an atomic read (add 0) on every retry, not a plain load the Metal compiler may keep in a register: a stale value livelocks the CAS loop on Apple GPUs
+            Operand oldValue = context.AtomicAdd(StorageKind.SharedMemory, Const(id), wordOffset, Const(0));
             Operand newValue = opCallback(oldValue);
 
             Operand casResult = context.AtomicCompareAndSwap(StorageKind.SharedMemory, id, wordOffset, oldValue, newValue);
