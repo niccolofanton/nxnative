@@ -701,6 +701,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
     uint64_t ind = 0, ind_first = 0;
     if (dw->ind) { void *mb; uint64_t mo;
         if (!mdx_find(dw->ind, dw->ind, &ind)) { mdx_run(dw, NULL); if (!mdx_find(dw->ind, dw->ind, &ind)) ind = 0; }
+        if (ind) indc_note(g_mdx_js, ts, ms);   // the clamp log's shaders for this record (DM_NVN_IND_CLAMP)
         if (!ind || !mtl_gpu_addr(dw->ind, 8, &mb, &mo, &ind_first)) { RED_ONCE(154, "DrawMeshTasksIndirect record at %#llx is in no memory pool: draw skipped", (unsigned long long)dw->ind); return; }
         ind_first += 4; }
     ts_rangelog(dw, ts);
