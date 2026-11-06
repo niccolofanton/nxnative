@@ -3304,6 +3304,22 @@ int mtl_tex_gpu_owned(uint64_t serial) {
     if (!o || ![o conformsToProtocol:@protocol(MTLTexture)]) return 0;
     return (((id<MTLTexture>)o).usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) != 0;
 }
+// DM_NVN_FT_UNC=1: an exception to the rule above for nvn_ft_poll. tex_desc gives every uncompressed GPU-only texture render-target use (NVN has no flag that tells a render target), so
+// mtl_tex_gpu_owned holds for any uncompressed texture first resolved before the CPU filled it, and the poll dropped it without an upload. Ocarina of Time binds its terrain tiles'
+// height (R32F), blend and hole (RGBA8) maps before its loader writes them: when the submit thread wins that race they stay zeros (flat blue holes with grass floating in them; seen on
+// an M1 Pro, not on the M6). Taken here by tex_cpu_content's rule: no image, depth, display or video-decode use, not shader-writable, in a pool the GPU has not written; it goes into
+// g_cpu_unc, so the pool's first GPU write makes it a GPU texture again (cpu_unc_drop). Read at each hit (rare), so DM_CTL "env" switches it mid-run
+int mtl_tex_ft_unc(const tex_t *t) {
+    const char *e = getenv("DM_NVN_FT_UNC"); if (!e || atoi(e) <= 0) return 0;
+    if (!t->serial || !t->mem || !t->pool || t->pool->magic != MAGIC('P', 'O', 'O', 'L') || atomic_load_explicit(&t->pool->gpu_written, memory_order_relaxed)) return 0;
+    if (fmt_compressed(t->d.format) || fmt_depth(t->d.format) || t->d.samples > 1 || (t->d.flags & (NVN_TEXTURE_FLAGS_IMAGE | NVN_TEXTURE_FLAGS_DISPLAY | NVN_TEXTURE_FLAGS_VIDEO_DECODE))) return 0;
+    __unsafe_unretained id o = tex_get(t->serial);
+    if (!o || ![o conformsToProtocol:@protocol(MTLTexture)] || (((id<MTLTexture>)o).usage & MTLTextureUsageShaderWrite)) return 0;
+    uint64_t s = t->serial; pthread_mutex_lock(&g_cpu_tex_mu); nvn_hm_put(&g_cpu_unc, &s, (void *)t->pool); pthread_mutex_unlock(&g_cpu_tex_mu);
+    static uint64_t n; if (n++ < 8 || !(n & 255)) MLOG("DM_NVN_FT_UNC: ser=%llu %ux%ux%u format %#x written by the CPU after its first use: uploaded from its storage instead of staying a GPU texture (%llu so far)",
+                                                    (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, (unsigned long long)n);
+    return 1;
+}
 void mtl_tex_cpu_written(const tex_t *t) {
     uint64_t serial = t->serial;
     if (!serial) return;

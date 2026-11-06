@@ -449,7 +449,11 @@ void nvn_ft_poll(void) {
         } else cur++;
     }
     pthread_mutex_unlock(&g_ft_mu);
-    for (size_t i = 0; i < nhit; i++) if (!mtl_tex_gpu_owned(hit[i].serial)) mtl_tex_cpu_written(&hit[i]);   // outside g_ft_mu: the ownership check takes the replay's serial table lock
+    for (size_t i = 0; i < nhit; i++) {   // outside g_ft_mu: the ownership check takes the replay's serial table lock
+        if (!mtl_tex_gpu_owned(hit[i].serial) || mtl_tex_ft_unc(&hit[i])) { mtl_tex_cpu_written(&hit[i]); continue; }
+        static uint64_t ng; if (ng++ < 8 || !(ng & 255)) LOG("[nvn] tex_dirty_upload: ser=%llu %ux%ux%u format %#x written by the CPU after its first use, left a GPU texture (render-target or image use), not uploaded (%llu so far; DM_NVN_FT_UNC=1 uploads uncompressed ones)",
+                                                             (unsigned long long)hit[i].serial, hit[i].d.width, hit[i].d.height, hit[i].d.depth, hit[i].d.format, (unsigned long long)ng);
+    }
 }
 static void ft_flush(const uint8_t *a, uint64_t n) {
     if (!DM_GAME_TEX_FLUSH_UPLOAD || !a || !n) return;
