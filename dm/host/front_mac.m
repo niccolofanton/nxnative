@@ -528,8 +528,50 @@ static void *guest_tramp(void *p) {
     ((guest_arg *)p)->fn(); LOG("guest thread finished"); exit(0);
 }
 
+// ---------- GPU preset (DM_PRESET): defaults for switches the user did not set, on GPUs where they were measured ----------
+// M1-class GPUs (Apple7 family: M1, M1 Pro / Max / Ultra) run Ocarina of Time's title movie and reflection probe GPU-bound. Each row is setenv(name, value, 0): an explicit
+// environment value (shell, DM_CTL "env" later) always wins. Every switch here is read lazily by nvn_mtl.m at its first dispatch / draw (ndve_mode, probe_visit, the
+// DM_NVN_CS_DEPS check), all long after this constructor. Measured on an M1 Pro; edit the table to change the preset
+#define PRESET_M1_PROGRAM 0x0400486024DEC000ull   // The Legend of Zelda: Ocarina of Time
+static const struct { const char *name, *value; int on; } k_preset_m1[] = {
+    {"DM_NVN_NDVE_MOVIE_DIRECT", "2", 1},   // NDVE movie network skipped: title / movie 52 -> 16.7 ms a frame
+    {"DM_NVN_PROBE_EVERY", "4", 1},         // a reflection probe face drawn every 4th visit: -5-6 ms GPU; also avoids a GPU page fault after Continue
+    {"DM_NVN_CS_DEPS", "1", 1},             // compute barriers only where ranges overlap: about -4 ms
+    {"DM_UPSCALER", "metalfx", 0},          // NDSR network off. TODO: enable after the MetalFX colour fix is verified
+};
+// DM_PRESET=auto (default): this game on an Apple7-family GPU; m1: this game on any GPU; off: nothing. Runs before main, after front_hud_env (the GPU query makes the
+// process's first Metal device, which reads MTL_HUD_ENABLED)
+static void front_preset_env(void) {
+    const char *p = getenv("DM_PRESET"); if (!p || !*p) p = "auto";
+    if (!strcmp(p, "off")) return;
+    int force = !strcmp(p, "m1");
+    if (!force && strcmp(p, "auto")) { LOG("[RED] DM_PRESET=%s is not auto, m1 or off: no preset", p); return; }
+    if (DM_GAME_PROGRAM_ID != PRESET_M1_PROGRAM) return;   // measured on this game only
+    char gpu[128] = "not queried";
+    if (!force) {
+        int m1 = 0;
+        @autoreleasepool {
+            id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
+            if (!dev) return;
+            snprintf(gpu, sizeof gpu, "%s", dev.name.UTF8String ?: "?");
+            if (@available(macOS 13.0, *)) m1 = [dev supportsFamily:MTLGPUFamilyApple7] && ![dev supportsFamily:MTLGPUFamilyApple8];
+            else m1 = [dev supportsFamily:MTLGPUFamilyApple7] && [dev.name hasPrefix:@"Apple M1"];   // no Apple8 query before macOS 13
+        }
+        if (!m1) return;
+    }
+    char set[512] = "", kept[512] = "";
+    for (size_t i = 0; i < sizeof k_preset_m1 / sizeof *k_preset_m1; i++) {
+        if (!k_preset_m1[i].on) continue;
+        const char *cur = getenv(k_preset_m1[i].name);
+        char *dst = cur ? kept : set; size_t n = strlen(dst);
+        snprintf(dst + n, 512 - n, "%s%s=%s", n ? " " : "", k_preset_m1[i].name, cur ? cur : k_preset_m1[i].value);
+        if (!cur) setenv(k_preset_m1[i].name, k_preset_m1[i].value, 0);
+    }
+    LOG("GPU preset m1 (DM_PRESET=%s, GPU %s): set %s; kept from the environment: %s", p, gpu, *set ? set : "none", *kept ? kept : "none");
+}
+
 // Metal reads MTL_HUD_ENABLED when the process makes its first device, which can be before the window: set from DM_METAL_HUD before main (set in front_run, the HUD did not show)
-__attribute__((constructor)) static void hud_env(void) { front_hud_env(); }
+__attribute__((constructor)) static void hud_env(void) { front_hud_env(); front_preset_env(); }
 
 // ---------- Cheats: the menu and the panel (hle_cheats.c holds every state; these only show it and call it) ----------
 
