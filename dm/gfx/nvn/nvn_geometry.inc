@@ -552,11 +552,37 @@ static void geo_mesh_encode(id<MTLRenderCommandEncoder> en_) {
 // draw's first workgroup at buffer 29. Native meshes have no equivalent stand-in: build required misses before encoding the draw, and prewarm the recorded state next time (nanotchec's #1368).
 static struct { int on, miss; NvShader *ts, *ms; uint32_t first, count; uint64_t ind; } g_mtk;
 static void draw_(const p_draw *dw, const p_draw_idx *di);
-static uint64_t g_mtk_n, g_mtk_wait;   // draws, draws left out while a required pipeline was missing (none expected once it is built before the draw)
+static uint64_t g_mtk_n, g_mtk_wait, g_mtk_built;   // draws, draws left out while a required pipeline was missing (none expected once it is built before the draw)
 static nvn_hmap g_pso_mtk = {.klen = sizeof(pso_key)};   // demand and warm results are installed on the submit thread
-static id<MTLRenderPipelineState> mtk_build(const pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs, NSError **error) {
+// The pipeline itself, on any thread (the draw's own build, the prewarm's workers, the prebuild tool). With the Metal 4 compiler and a Metal 4 descriptor for every function it is taken from
+// the pipeline archive or built and captured into it, as a compute pipeline is (cps_make), so an M row of the prewarm lists costs a lookup at the next start and the prebuild tool can put
+// the lists' M rows in the archive; else (or if the Metal 4 compiler refuses it) through the MTLDevice. *found: taken from the archive
+static id<MTLRenderPipelineState> mtk_build(const pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs, NSError **error, int *found) {
+    if (found) *found = 0;
     MTLRenderPipelineDescriptor *d = pso_desc(k, nil, fs, nil, 0);
     if (!pso_ds_valid((uint32_t)d.depthAttachmentPixelFormat, (uint32_t)d.stencilAttachmentPixelFormat)) return nil;
+    MTL4FunctionDescriptor *mf = pso4_compiler() ? fn4_of(ms->fn) : nil, *of = mf && ts ? fn4_of(ts->fn) : nil, *f4 = mf && d.fragmentFunction ? fn4_of(d.fragmentFunction) : nil;
+    if (mf && (!d.fragmentFunction || f4) && (!ts || of)) {
+        MTL4MeshRenderPipelineDescriptor *m = [MTL4MeshRenderPipelineDescriptor new];
+        m.meshFunctionDescriptor = mf; if (f4) m.fragmentFunctionDescriptor = f4; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
+        if (ts) { m.objectFunctionDescriptor = of; m.payloadMemoryLength = (ts->mesh_payload + 15u) & ~15u; m.maxTotalThreadsPerObjectThreadgroup = ts->mesh_threads; }
+        m.rasterSampleCount = d.rasterSampleCount; m.alphaToCoverageState = d.alphaToCoverageEnabled ? MTL4AlphaToCoverageStateEnabled : MTL4AlphaToCoverageStateDisabled;
+        for (int i = 0; i < 8; i++) pso_col4(m.colorAttachments[i], d.colorAttachments[i]);
+        for (id<MTL4Archive> a in g_arch4p) { id<MTLRenderPipelineState> ps = [a newRenderPipelineStateWithDescriptor:m error:nil]; if (ps) { if (found) *found = 1; return ps; } }
+        for (id<MTL4Archive> a in g_arch4) { id<MTLRenderPipelineState> ps = [a newRenderPipelineStateWithDescriptor:m error:nil]; if (ps) { if (found) *found = 1; return ps; } }
+        NSError *e4 = nil; id<MTLRenderPipelineState> ps;
+        if (!g_arch_cap) ps = [g_comp4 newRenderPipelineStateWithDescriptor:m compilerTaskOptions:nil error:&e4];
+        else {
+            ArchEpoch *ep = ep_enter();
+            ps = [ep->comp newRenderPipelineStateWithDescriptor:m compilerTaskOptions:nil error:&e4];
+            if (ps) { atomic_fetch_add(&ep->n, 1); atomic_fetch_add(&g_arch_new, 1); }   // no vertex layout, as a compute pipeline (cps_make)
+            ep_leave(ep);
+            if (ps) arch_note_new();
+        }
+        if (ps) return ps;
+        static _Atomic int once; if (!atomic_exchange(&once, 1)) MLOG("[RED] task / mesh pipeline: the Metal 4 compiler refused task %s mesh %s fragment %s (%s); built through the MTLDevice instead",
+                                                                      ts ? ts->key : "-", ms->key, fs ? fs->key : "-", e4.localizedDescription.UTF8String);
+    }
     MTLMeshRenderPipelineDescriptor *m = [MTLMeshRenderPipelineDescriptor new];
     m.meshFunction = ms->fn; m.fragmentFunction = d.fragmentFunction; m.maxTotalThreadsPerMeshThreadgroup = ms->mesh_threads;
     if (ts) { m.objectFunction = ts->fn; m.payloadMemoryLength = (ts->mesh_payload + 15u) & ~15u; m.maxTotalThreadsPerObjectThreadgroup = ts->mesh_threads; }
@@ -582,7 +608,7 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
     id ps = hm_get_id(&g_pso_mtk, &k);
     if (ps) return ps == NSNull.null ? nil : ps;
     NSError *error = nil; uint64_t start = bp_now();
-    ps = mtk_build(&k, ts, ms, fs, &error);
+    int found = 0; ps = mtk_build(&k, ts, ms, fs, &error, &found);
     uint64_t elapsed = bp_now() - start;
     g_bp_pso_n++; g_bp_pso_ns += elapsed;
     const char *task = ts ? ts->key : "-";
@@ -591,13 +617,13 @@ static id<MTLRenderPipelineState> mtk_pso(NvProg *raster) {
              error ? error.localizedDescription.UTF8String : "invalid depth/stencil formats");
         hm_put_id(&g_pso_mtk, &k, NSNull.null); return nil;
     }
-    hm_put_id(&g_pso_mtk, &k, ps);
+    hm_put_id(&g_pso_mtk, &k, ps); g_mtk_built++;
     k.fsfn = NULL;   // The third function has its own key column; this is not a specialized fragment.
     pso_skey sk; char hex[sizeof sk * 2 + 1];
     pso_skey_from(&k, ms, fs, 0, NULL, &sk); pso_skey_hex(&sk, hex);
     pso_record("M\t%s\t%s\n", task, hex); pso_user_record("M\t%s\t%s\n", task, hex);
-    MLOG("task / mesh pipeline: task %s mesh %s fragment %s, %.1f ms required at frame %llu", task, ms->key, fs ? fs->key : "-",
-         elapsed / 1e6, (unsigned long long)atomic_load(&g_cur_frame));
+    MLOG("task / mesh pipeline: task %s mesh %s fragment %s, %.1f ms required at frame %llu%s", task, ms->key, fs ? fs->key : "-",
+         elapsed / 1e6, (unsigned long long)atomic_load(&g_cur_frame), found ? " (from the pipeline archive)" : "");
     return ps;
 }
 static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
