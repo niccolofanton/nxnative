@@ -12132,6 +12132,7 @@ static int lc_keeps(uint32_t op) {
 
 static void dispatch(const p_dispatch *dp);
 static int up_mfx_wanted(NvShader *cs); static int up_mfx_encode(NvShader *cs);   // a game's upscaler through MetalFX (see up_mfx_encode)
+static int g_up_mfx_nw; static void up_mfx_watch(NvShader *cs);   // MetalFX outputs of this frame, and the check of a later upscaler stage against them (see up_mfx_watch)
 // ---------- Compute dispatches moved ahead of the render pass they would split (DM_NVN_CS_HOIST) ----------
 // Metal cannot run a compute dispatch inside a render pass, so a dispatch between two draws of one pass ends it, and on a tile-based GPU every attachment is stored and loaded again:
 // Breath of the Wild runs one GPU particle dispatch per emitter between the G-buffer's effect draws, six to eight splits of a 1600x900 G-buffer a frame (about 350 MB of attachment
@@ -13040,6 +13041,7 @@ static void dispatch(const p_dispatch *dp) {
     if (g_nubd && ubd_conflict_cs(cs, dp->ind)) { g_ubd_conflicts++; ubd_land(); }   // see ubd_conflict_cs
     rp_flush();   // A full clear with no draw after it waits for the next pass on its targets, but it comes before this dispatch, which may read or write them as images: land it first, as copy_t2t does
     image_prepare(program, 0x20);
+    if (g_up_mfx_nw) up_mfx_watch(cs);   // a MetalFX output of this frame read by a later stage of the game's upscaler: that size goes back to the game's chain
     if (up_mfx_wanted(cs) && !dp->ind && up_mfx_encode(cs)) return;   // the game's upscaler, drawn by MetalFX instead (DM_UPSCALER=metalfx)
     int own = dispatch_own();
     if (own && g_blit) { enc_b_end(g_blit); g_blit = nil; }
@@ -14815,6 +14817,71 @@ static int up_mfx_rect(const uint32_t v[4], NSUInteger w, NSUInteger h, NVNcopyR
     if (v[0] > INT_MAX || v[1] > INT_MAX || rw > INT_MAX || rh > INT_MAX || (uint64_t)v[0] + rw > w || (uint64_t)v[1] + rh > h) return 0;
     *r = (NVNcopyRegion){(int)v[0], (int)v[1], 0, (int)rw, (int)rh, 1}; return 1;
 }
+// A chain that goes on past the stage MetalFX draws (DM_UPSCALER_MFX_FALLBACK). agl's NDSR runs as a chain of dispatches and MetalFX takes each one it recognises on its own (one texture in, one
+// image out, a larger output rectangle, a colour shape it draws); the other stages run as the game's. Which stage ends the chain is the game's choice per internal size: at Ocarina of Time's higher
+// dynamic resolutions (up to 1440x810) it can end at another upscaler stage (fa3033d05c0a41d6, b106afba1a18faa9 of agl_ndsr_vr_light.pck) that reads what the drawn stage wrote, expecting the
+// network's output there and not MetalFX's picture, and the 3D world turns black under the HUD. So the image each MetalFX dispatch writes is kept for the rest of its frame (g_cur_frame), and a
+// game upscaler shader (any of DM_GAME_UPSCALER_KEYS, drawn by MetalFX or not) that binds its memory later in that frame, as a texture or an image, gives that size pair (the drawn stage's input
+// and output rectangles) back to the game: from the next frame on that stage runs the game's shader, and the whole chain with it. Logged once per size pair. Other sizes keep MetalFX, so a
+// change of the internal size tries it again. DM_UPSCALER_MFX_FALLBACK=0 keeps MetalFX at every size (read again every 256 checks, so DM_CTL "env DM_UPSCALER_MFX_FALLBACK=…" switches it mid-run)
+typedef struct { uint64_t lo, hi, serial, frame; int iw, ih, ow, oh; char key[17]; } up_mfx_write;   // lo, hi: the output's storage range (0 when it has none), serial: its texture
+enum { UP_MFX_WRITES = 4, UP_MFX_FALLBACKS = 16 };
+static up_mfx_write g_up_mfx_w[UP_MFX_WRITES];
+static int g_up_mfx_fb[UP_MFX_FALLBACKS][4], g_up_mfx_nfb, g_up_mfx_fb_all;   // size pairs given back to the game (input w, h, output w, h); all: the table filled, every size is the game's
+static int up_mfx_fb_on(void) {
+    static int v = -1; static unsigned n;
+    if (v >= 0 && (n++ & 255)) return v;
+    const char *e = getenv("DM_UPSCALER_MFX_FALLBACK"); int w = !(e && !strcmp(e, "0"));
+    if (v >= 0 && w != v) MLOG("upscaler (DM_UPSCALER_MFX_FALLBACK): %s", w ? "a size whose chain goes on past MetalFX's stage goes back to the game's upscaler" : "MetalFX at every size, whatever reads its output");
+    return v = w;
+}
+static int up_mfx_fb_has(int iw, int ih, int ow, int oh) {
+    if (!up_mfx_fb_on()) return 0;
+    if (g_up_mfx_fb_all) return 1;
+    for (int i = 0; i < g_up_mfx_nfb; i++) if (g_up_mfx_fb[i][0] == iw && g_up_mfx_fb[i][1] == ih && g_up_mfx_fb[i][2] == ow && g_up_mfx_fb[i][3] == oh) return 1;
+    return 0;
+}
+static void up_mfx_drop_stale(uint64_t f) {   // writes of an earlier frame
+    int live = 0;
+    for (int i = 0; i < g_up_mfx_nw; i++) if (g_up_mfx_w[i].frame == f) g_up_mfx_w[live++] = g_up_mfx_w[i];
+    g_up_mfx_nw = live;
+}
+// A MetalFX dispatch's output (t, a copy of its image binding's texture), for up_mfx_watch
+static void up_mfx_note(NvShader *cs, const tex_t *t, const NVNcopyRegion *ir, const NVNcopyRegion *orr) {
+    uint64_t f = atomic_load(&g_cur_frame);
+    up_mfx_drop_stale(f);
+    up_mfx_write *w = &g_up_mfx_w[g_up_mfx_nw < UP_MFX_WRITES ? g_up_mfx_nw++ : UP_MFX_WRITES - 1];
+    uint64_t lo = (uint64_t)(uintptr_t)t->mem;
+    *w = (up_mfx_write){.lo = lo, .hi = lo ? lo + pool_tex_size(t) : 0, .serial = t->serial, .frame = f, .iw = ir->width, .ih = ir->height, .ow = orr->width, .oh = orr->height};
+    strlcpy(w->key, cs->key, sizeof w->key);
+}
+// Called before every compute dispatch while a MetalFX output of the frame may still be live (g_up_mfx_nw): cs, if it is one of the game's upscaler shaders, binding one of them (see above)
+static void up_mfx_watch(NvShader *cs) {
+    up_mfx_drop_stale(atomic_load(&g_cur_frame));
+    if (!g_up_mfx_nw || cs->up_color == UP_COLOR_UNREAD || !up_mfx_fb_on()) return;   // up_color is read for the game's upscaler shaders only (up_mfx_read_color)
+    for (int b = 0; b < cs->rf.nb && g_up_mfx_nw; b++) {
+        int k = cs->rf.b[b].kind; unsigned reg = cs->rf.b[b].reg;
+        if (k != NVN_RB_TEX && k != NVN_RB_IMG) continue;
+        int tid = (int)((k == NVN_RB_TEX ? tex_slot_h(S.tex[5], S.img[5], reg) : reg < 32 ? S.img[5][reg] : 0) & 0xfffff);
+        uint64_t lo = 0, hi = 0, ser = 0;
+        os_unfair_lock_lock(&g_rmu);
+        if (tid > 0 && tid < g_ntreg && g_treg[tid].ok && !g_treg[tid].gone) { const tex_t *t = &g_treg[tid].t; lo = (uint64_t)(uintptr_t)t->mem; hi = lo ? lo + pool_tex_size(t) : 0; ser = t->serial; }
+        os_unfair_lock_unlock(&g_rmu);
+        if (!lo && !ser) continue;
+        for (int i = 0; i < g_up_mfx_nw; i++) {
+            up_mfx_write *w = &g_up_mfx_w[i];
+            if (!((ser && ser == w->serial) || (lo && w->lo && lo < w->hi && w->lo < hi))) continue;
+            if (k == NVN_RB_IMG && !strncmp(cs->key, w->key, 16)) continue;   // the drawn stage itself again, writing its output once more: not a later stage reading it
+            if (!up_mfx_fb_has(w->iw, w->ih, w->ow, w->oh)) {
+                if (g_up_mfx_nfb < UP_MFX_FALLBACKS) memcpy(g_up_mfx_fb[g_up_mfx_nfb++], (int[4]){w->iw, w->ih, w->ow, w->oh}, sizeof g_up_mfx_fb[0]);
+                else { g_up_mfx_fb_all = 1; MLOG("[RED] upscaler: %d size pairs given back to the game's upscaler; every size is the game's from now on", UP_MFX_FALLBACKS); }
+                MLOG("[RED] upscaler: %s binds (%s slot %u) the image MetalFX drew for %s this frame, %dx%d → %dx%d: the game's chain goes on past that stage at this size, so the game's upscaler draws %dx%d → %dx%d "
+                     "from the next frame (DM_UPSCALER_MFX_FALLBACK=0 keeps MetalFX)", cs->key, k == NVN_RB_TEX ? "texture" : "image", reg, w->key, w->iw, w->ih, w->ow, w->oh, w->iw, w->ih, w->ow, w->oh);
+            }
+            g_up_mfx_w[i--] = g_up_mfx_w[--g_up_mfx_nw];
+        }
+    }
+}
 // The dispatch of upscaler cs as MetalFX's spatial scaler from its texture slot's rectangle to its image slot's (see above): 1 when drawn, 0 to run the shader
 static int up_mfx_encode(NvShader *cs) {
     int ti = -1, oi = -1;
@@ -14837,6 +14904,7 @@ static int up_mfx_encode(NvShader *cs) {
     if (!in || !out || in == out || in.textureType != MTLTextureType2D || out.textureType != MTLTextureType2D || in.sampleCount != 1 || out.sampleCount != 1 ||
         fmt_int_or_ds(in.pixelFormat) || fmt_int_or_ds(out.pixelFormat) || mtl_fmt_block(out.pixelFormat) || !up_mfx_rect(v, in.width, in.height, &ir) || !up_mfx_rect(v + 4, out.width, out.height, &orr) ||
         orr.width < ir.width || orr.height < ir.height || (orr.width == ir.width && orr.height == ir.height)) { g_up_mfx_kept++; return 0; }
+    if (up_mfx_fb_has(ir.width, ir.height, orr.width, orr.height)) { g_up_mfx_kept++; return 0; }   // a size whose chain went on past this stage: the game's (up_mfx_watch)
     // The colour MetalFX gets (DM_UPSCALER_MFX_MODE, up_mfx_mode): a gamma 2 variant's square drawn into the scaler's input (linear colour in, HDR or linear mode) or into the game's image after it
     int srgb = cs->up_color == UP_COLOR_SRGB, sqv = cs->up_color == UP_COLOR_SQ, um = up_mfx_mode();
     MTLFXSpatialScalerColorProcessingMode mode = um == UP_MODE_HDR || um == UP_MODE_RAW ? MTLFXSpatialScalerColorProcessingModeHDR : um == UP_MODE_LINEAR ? MTLFXSpatialScalerColorProcessingModeLinear :
@@ -14870,6 +14938,7 @@ static int up_mfx_encode(NvShader *cs) {
         args_dirty_all(); g_up_mfx_kept++; return 0;   // only the scratch image was scaled; the game's shader can still produce the output
     }
     args_dirty_all();
+    up_mfx_note(cs, &dout, &ir, &orr);
     if (!g_up_mfx_n++) MLOG("upscaler: first dispatch of %s drawn by MetalFX, %dx%d at %d,%d of %lux%lu (format %lu) → %dx%d at %d,%d of %lux%lu (format %lu)%s", cs->key, ir.width, ir.height, ir.xoffset, ir.yoffset,
                             (unsigned long)in.width, (unsigned long)in.height, (unsigned long)in.pixelFormat, orr.width, orr.height, orr.xoffset, orr.yoffset, (unsigned long)out.width, (unsigned long)out.height,
                             (unsigned long)out.pixelFormat, direct ? ", straight" : srgb ? ", through RGBA16F, decoded from sRGB" : sq_in ? ", through RGBA16F, squared before the scaler" : sq_out ? ", through RGBA16F, squared after the scaler" : ", through RGBA16F");
