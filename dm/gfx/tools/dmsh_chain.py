@@ -48,9 +48,9 @@ def loop_cap():
     if not v.isdigit() or int(v) >= 1 << 32: sys.exit(f'[RED] DMSH_LOOP_CAP={v}: expected an iteration count below 2^32 (0 = no limit)')
     return int(v)
 
-# agl's task shaders 99280b7b8aae78df / 47f9b38490dcf9a2 (Ocarina of Time) loop (min(end - start, 256) - 1) >> 5 times, unsigned: a group dispatched on an empty bucket
-# (end == start) loops 2^27 - 1 times and hangs the GPU; valid data never needs more than 8 passes (256 / 32). DMSH_LOOP_CAP_KEYS=<key>:<cap>[,...] (default these two at 64, 8x the valid maximum, in case of inner loops; "" = none)
-LOOP_CAP_KEYS_DEFAULT = '47f9b38490dcf9a2:64,99280b7b8aae78df:64'
+# agl's task shaders 99280b7b8aae78df / 47f9b38490dcf9a2 / f75708d176bb6591 (Ocarina of Time) loop (min(end - start, 256) - 1) >> 5 times, unsigned: a group dispatched on an empty bucket
+# (end == start) loops 2^27 - 1 times and hangs the GPU; valid data never needs more than 8 passes (256 / 32). DMSH_LOOP_CAP_KEYS=<key>:<cap>[,...] (default: the three agl task shaders at 64, 8x the valid maximum; nine Model / Agl pixel shaders whose clustered light-list loop reads its count from a storage buffer with no min() at 256; "" = none)
+LOOP_CAP_KEYS_DEFAULT = '47f9b38490dcf9a2:64,99280b7b8aae78df:64,f75708d176bb6591:64,0234f634ed411a85:256,74a006f0005b2f7a:256,e2f868a2799ed178:256,fa20be590aae1d99:256,cecf164164f89670:256,5ad65c0eefd09c7f:256,d771b87d65be5aa4:256,2de775822c08b025:256,fa998d0ed212944a:256'
 def loop_cap_keys():
     v = os.environ.get('DMSH_LOOP_CAP_KEYS', LOOP_CAP_KEYS_DEFAULT); out = {}
     for item in filter(None, v.split(',')):
