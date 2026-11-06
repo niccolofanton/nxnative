@@ -12205,6 +12205,18 @@ static void ndve_net_done(int ok) {   // the final dispatch's direct draw, mode 
         static int once; if (g_ndve_skip && !once++) MLOG("[RED] NDVE movie (DM_NVN_NDVE_MOVIE_DIRECT=2): the direct draw failed after %u network dispatches were skipped: the game's final dispatch ran on stale inputs this frame", g_ndve_skip);
     }
 }
+// DM_NVN_SKIP_CS=<compute key>[,…] drops every dispatch of those compute shaders (16-digit keys; read again every 256 dispatches, so DM_CTL env can change it): a stop-gap
+// for a shader that hangs the GPU (Ocarina's RED.F32 scene sums 21d9f83e6027c565 livelock their float-add CAS loop on an M1 Pro), or to measure a shader's cost. The picture may be wrong
+static int skip_cs(NvShader *cs) {
+    static char list[512]; static int have = -1; static unsigned n;
+    if (have < 0 || !(n++ & 255)) { const char *e = getenv("DM_NVN_SKIP_CS"); have = e && *e; if (have) { strncpy(list, e, sizeof list - 1); } }
+    if (!have) return 0;
+    for (const char *k = list; *k; ) {
+        if (!strncmp(k, cs->key, 16)) { static int lg; if (lg++ < 8) MLOG("DM_NVN_SKIP_CS: a dispatch of %s dropped", cs->key); return 1; }
+        const char *c = strchr(k, ','); if (!c) break; k = c + 1;
+    }
+    return 0;
+}
 static void dispatch(const p_dispatch *dp) {
     zskip_clear();
     g_wr_epoch++; g_mdx_epoch++;
@@ -12216,6 +12228,7 @@ static void dispatch(const p_dispatch *dp) {
     NvProg *program = prog_get(S.cprog);
     NvShader *cs = program->sh[5];
     if (!cs) { RED_ONCE(28, "the dispatched program has no compute shader (or it is not mapped)"); return; }
+    if (skip_cs(cs)) return;
     int ndve = !dp->ind && dp->x && dp->y && dp->z == 1 ? ndve_direct_role(cs) : 0;
     if (ndve == 1) { g_ndve_decoded = nil; ndve_net_reset(); }
     if (ndve == 2 && g_ndve_decoded) {
