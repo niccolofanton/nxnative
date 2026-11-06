@@ -12483,10 +12483,102 @@ static int dispatch_own(void) {
     if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_OWN"); v = (e && !strcmp(e, "1")) || pg_on(); if (v) MLOG("compute dispatches: each in an encoder of its own (DM_NVN_DISPATCH_OWN=1 or DM_NVN_PASSGPU)"); }
     return v;
 }
-static id<MTL4ComputeCommandEncoder> dispatch_enc(void) {
+// Compute dependencies (DM_NVN_CS_DEPS=1, off by default; read again every 1,024 dispatches so a DM_CTL "env DM_NVN_CS_DEPS=…" line A/Bs it mid-run). Metal 4 tracks no hazards inside
+// an encoder: dispatches with no barrier between them may run at the same time, so a dependent one needs barrierAfterEncoderStages (blit_barrier). By default every dispatch is recorded as
+// "everything written" and the next copy or dispatch always waits for it: Ocarina of Time's frames open with about 114 dispatches of some 70 programs (foliage first), serialized, ~9-10 ms
+// of GPU on an M1 Pro. With the switch a dispatch records the guest ranges it reads and writes, as buffer copies do (blit_buf): uniform buffers (CBUF / UBOP) and storage buffers
+// (SBUFP, written when the binding is rw) by their bound range, textures, buffer textures and images (written when rw or atomic) by their texture's storage in its pool (tex_t mem +
+// L.size: overlapping storage on NVN is the only way two host textures share memory, see POOL_HEAP_SCALE). It gets a barrier only when it reads a range written since the last barrier,
+// or writes a range read or written since then (RAW / WAW / WAR); copies after it check against its ranges the same way. Anything else is "everything", as before: indirect dispatches,
+// host kernels (rb_swap_gpu), raw global memory (GMEM / GMEML, the foliage shader), addresses or handles from a uniform buffer (SBUFU / IMGU / TEXU / TBUFU), handle arrays and pools
+// (TEXD / TEXA / TEXP / TEXH), a texture without storage or whose pool is gone, a sparse range (nvn_sparse_alias), more ranges than the lists hold
+typedef struct { uint64_t wlo[BW_MAX], whi[BW_MAX], rlo[BW_MAX], rhi[BW_MAX]; int nw, nr; } cs_deps;
+static uint64_t g_csd_barrier, g_csd_saved, g_csd_full, g_csd_full_bar, g_csd_frame;   // dispatches with ranges: barrier emitted / saved; dispatches recorded as everything (and their barriers), this window
+static int csd_on(void) {
+    static int v = -1, seen; static unsigned n;
+    if (v < 0 || !(n++ & 1023)) {
+        const char *e = getenv("DM_NVN_CS_DEPS"); int nv = e && !strcmp(e, "1");
+        if (nv && !seen) { seen = 1; MLOG("DM_NVN_CS_DEPS=1: compute dispatches in the copy encoder get a barrier only when their buffer / texture / image ranges overlap the writes (or, for writes, the reads) since the last barrier"); }
+        else if (seen && nv != v) MLOG("DM_NVN_CS_DEPS switched %s", nv ? "on" : "off (every dispatch waits for everything before it)");
+        if (nv && v != 1) { g_csd_barrier = g_csd_saved = g_csd_full = g_csd_full_bar = 0; g_csd_frame = atomic_load(&g_cur_frame); }   // the counters' window starts when it engages
+        v = nv;
+    }
+    return v;
+}
+static int csd_add(uint64_t *lo, uint64_t *hi, int *n, uint64_t a, uint64_t b) {
+    if (b <= a) return 1;   // nothing (an unbound slot: encode_args binds a dummy)
+    for (int i = 0; i < *n; i++) if (a <= hi[i] && lo[i] <= b) { lo[i] = MIN(lo[i], a); hi[i] = MAX(hi[i], b); return 1; }   // touching or overlapping: one range
+    if (*n == BW_MAX) return 0;
+    lo[*n] = a; hi[(*n)++] = b; return 1;
+}
+// A bound uniform / storage buffer's guest range as encode_args binds it (size 0: to the end of its Metal buffer, sbw_len). 0 = not known
+static int csd_buf(const p_bind_buf *u, uint64_t *lo, uint64_t *hi) {
+    *lo = *hi = 0; void *mb; uint64_t mo, gpu;
+    if (!u || !u->addr || !mtl_gpu_addr(u->addr, u->size ? u->size : 1, &mb, &mo, &gpu)) return 1;   // the dummy buffer
+    uint64_t len = sbw_len(u->size, mb, mo);
+    if (!len || u->addr > UINT64_MAX - len || nvn_sparse_alias(u->addr, u->addr + len)) return 0;
+    *lo = u->addr; *hi = u->addr + len; return 1;
+}
+// A texture ID's storage (every view of it lies there). Caller holds g_rmu. 0 = not known
+static int csd_tex(int tid, uint64_t *lo, uint64_t *hi) {
+    *lo = *hi = 0;
+    if (tid <= 0) return 1;   // an empty slot: the dummy
+    if (tid >= g_ntreg || !g_treg[tid].ok || g_treg[tid].gone) return 0;
+    const tex_t *t = &g_treg[tid].t; uint64_t a = (uint64_t)(uintptr_t)t->mem, n = t->L.size;
+    if (!a || !n || a > UINT64_MAX - n || nvn_sparse_alias(a, a + n)) return 0;
+    *lo = a; *hi = a + n; return 1;
+}
+// The ranges a dispatch of cs reads and writes with the current bindings; NULL when one is not known (the dispatch is then recorded as everything)
+static const cs_deps *csd_collect(NvShader *cs, cs_deps *d) {
+    d->nw = d->nr = 0; int ok = 1, bad = -1;
+    os_unfair_lock_lock(&g_rmu);   // the texture registration table (as encode_args)
+    for (int i = 0; i < cs->rf.nb && ok; i++) {
+        const nvn_rbind *b = &cs->rf.b[i]; unsigned reg = b->reg; uint64_t lo, hi;
+        switch (b->kind) {
+        case NVN_RB_SAMP: case NVN_RB_SAMPT: case NVN_RB_SAMPU: case NVN_RB_SAMPI: case NVN_RB_SAMPD: case NVN_RB_SAMPA: case NVN_RB_SAMPP:
+        case NVN_RB_SUPPORT: case NVN_RB_C1: case NVN_RB_DRV0: case NVN_RB_DRV2: case NVN_RB_PUSH: case NVN_RB_BORDER:
+            break;   // samplers and blocks the host fills from the CPU: no GPU work writes them
+        case NVN_RB_CBUF: case NVN_RB_UBOP:
+            ok = csd_buf(reg < 16 ? &S.ubo[5][reg] : NULL, &lo, &hi) && csd_add(d->rlo, d->rhi, &d->nr, lo, hi); break;
+        case NVN_RB_SBUFP:
+            ok = csd_buf(reg < 16 ? &S.ssbo[5][reg] : NULL, &lo, &hi) && (b->rw ? csd_add(d->wlo, d->whi, &d->nw, lo, hi) : csd_add(d->rlo, d->rhi, &d->nr, lo, hi)); break;
+        case NVN_RB_TEX: case NVN_RB_TBUF:
+            ok = csd_tex((int)(tex_slot_h(S.tex[5], S.img[5], reg) & 0xfffff), &lo, &hi) && csd_add(d->rlo, d->rhi, &d->nr, lo, hi); break;
+        case NVN_RB_IMG:
+            ok = csd_tex(reg < 32 ? (int)(S.img[5][reg] & 0xfffff) : 0, &lo, &hi) && (b->rw || b->atom ? csd_add(d->wlo, d->whi, &d->nw, lo, hi) : csd_add(d->rlo, d->rhi, &d->nr, lo, hi)); break;
+        default: ok = 0;   // raw global memory, addresses / handles from a uniform buffer, handle arrays and pools, anything new
+        }
+        if (!ok) bad = b->kind;
+    }
+    os_unfair_lock_unlock(&g_rmu);
+    if (!ok && !(cs->logged & (1ull << 32))) { cs->logged |= 1ull << 32; static int nlog; if (nlog++ < 16) MLOG("DM_NVN_CS_DEPS: compute shader %s waits for everything (binding kind %d not tracked)", cs->key, bad); }
+    return ok ? d : NULL;
+}
+static void csd_window(void) {   // the counters, every 3,600 frames
+    uint64_t f = atomic_load(&g_cur_frame);
+    if (f - g_csd_frame < 3600) return;
+    if (g_csd_barrier || g_csd_saved || g_csd_full) MLOG("DM_NVN_CS_DEPS: frames %llu-%llu: %llu dispatches with tracked ranges, %llu barriers emitted, %llu saved; %llu dispatches recorded as everything (%llu barriers)",
+        (unsigned long long)g_csd_frame, (unsigned long long)f, (unsigned long long)(g_csd_barrier + g_csd_saved), (unsigned long long)g_csd_barrier, (unsigned long long)g_csd_saved, (unsigned long long)g_csd_full, (unsigned long long)g_csd_full_bar);
+    g_csd_frame = f; g_csd_barrier = g_csd_saved = g_csd_full = g_csd_full_bar = 0;
+}
+// d: the dispatch's ranges (csd_collect); NULL = everything, as host kernels and indirect dispatches are
+static id<MTL4ComputeCommandEncoder> dispatch_enc(const cs_deps *d) {
     id<MTL4ComputeCommandEncoder> e = blit_open(); g_gp_disp++;
-    if (g_blit_ops) blit_barrier();
-    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // recorded as "everything written": the next copy or dispatch gets a barrier
+    if (!d) {
+        if (g_blit_ops) { blit_barrier(); g_csd_full_bar++; }
+        g_csd_full++;
+        g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // recorded as "everything written": the next copy or dispatch gets a barrier
+    } else {
+        if (g_blit_ops) {
+            int hit = g_bw_n + d->nw > BW_MAX || g_br_n + d->nr > BW_MAX;   // no room: start the lists again after a barrier
+            for (int i = 0; !hit && i < d->nr; i++) hit = bw_hit(d->rlo[i], d->rhi[i]);
+            for (int i = 0; !hit && i < d->nw; i++) hit = bw_hit(d->wlo[i], d->whi[i]) || br_hit(d->wlo[i], d->whi[i]);
+            if (hit) { blit_barrier(); g_csd_barrier++; } else g_csd_saved++;
+        }
+        for (int i = 0; i < d->nw; i++) { g_bw_lo[g_bw_n] = d->wlo[i]; g_bw_hi[g_bw_n++] = d->whi[i]; }   // both fit: at most BW_MAX each (csd_add), and the lists were emptied when they would not
+        for (int i = 0; i < d->nr; i++) { g_br_lo[g_br_n] = d->rlo[i]; g_br_hi[g_br_n++] = d->rhi[i]; }
+        g_blit_ops++;   // texture copies (blit) still wait for it
+    }
     if (!g_blit_ct) { [e setArgumentTable:g_ct]; g_blit_ct = 1; }
     args_dirty_all();
     return e;
@@ -12670,7 +12762,9 @@ static void dispatch(const p_dispatch *dp) {
     if (up_mfx_wanted(cs) && !dp->ind && up_mfx_encode(cs)) return;   // the game's upscaler, drawn by MetalFX instead (DM_UPSCALER=metalfx)
     int own = dispatch_own();
     if (own && g_blit) { enc_b_end(g_blit); g_blit = nil; }
-    id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc();
+    cs_deps deps; const cs_deps *dd = NULL;
+    if (!own && csd_on()) { if (!dp->ind) dd = csd_collect(cs, &deps); csd_window(); }   // indirect: its group counts come through copies and the clamp kernel in the encoder, recorded as everything
+    id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc(dd);
     if (dp->ind && dpc_on()) {   // the GPU-written group counts, clamped into the frame arena first (see dpc_clamp); the dispatch and the c0 copy below read the clamped ones
         uint64_t cg; __strong id<MTLBuffer> cb_ = nil; size_t co;
         if (dpc_clamp_enc(ce, ig, &cb_, &co, &cg)) { ib = (__bridge void *)cb_; io = co; ig = cg; }
@@ -12718,7 +12812,7 @@ static int rb_swap_gpu(uint64_t src, size_t row, size_t img, uint64_t dst, size_
     id<MTLBuffer> pb; size_t po = arena_alloc(48, &pb);
     struct { uint64_t s, d; uint32_t w, h, row, img, drow, dimg, shift; } *p = (void *)((uint8_t *)pb.contents + po);
     *p = (typeof(*p)){src, dst, (uint32_t)(wb / 2), (uint32_t)rows, (uint32_t)row, (uint32_t)img, (uint32_t)drow, (uint32_t)dimg, (uint32_t)shift};
-    id<MTL4ComputeCommandEncoder> e = dispatch_enc();
+    id<MTL4ComputeCommandEncoder> e = dispatch_enc(NULL);
     [g_ct setAddress:pb.gpuAddress + po atIndex:0]; enc_c_pso(e, ps);
     enc_c_dispatch(e, MTLSizeMake((wb / 2 + 63) / 64, rows, nz), MTLSizeMake(64, 1, 1));
     static int once; if (!once++) MLOG("RGB565-family copy between guest memory and a host texture: red and blue exchanged on the GPU (first case %zux%zux%zu texels)", wb / 2, rows, nz);
