@@ -49,6 +49,15 @@ Measured on an M6 Mac with 16 GB, headless, on one walk with camera turns (`walk
 - With a window, the first start on a new chain runs the pipeline prebuild first: 33,190 shader pairs, 691 s on this Mac. A run with no window skips it.
 - The opening movie runs at the movie's own 24 fps pace during the story section and cannot be skipped: about 8 minutes on a new file.
 
+### M1-class Macs
+
+On an Apple7-family GPU (M1, M1 Pro / Max / Ultra) the host applies a preset before the game starts (`DM_PRESET`, default `auto`; `m1` forces it on any GPU, `off` disables it). It only fills in switches the environment does not set, and logs one `GPU preset m1` line. Measured on an M1 Pro:
+
+- `DM_NVN_NDVE_MOVIE_DIRECT=2`: title and movie frames 52 → 16.7 ms.
+- `DM_NVN_PROBE_EVERY=4`: about 5-6 ms less GPU time a frame; also avoids a GPU page fault after Continue.
+- `DM_NVN_CS_DEPS=1`: about 4 ms less.
+- `DM_UPSCALER=metalfx` (NDSR network off) is in the table but disabled until the MetalFX colour fix is verified.
+
 ## Memory
 
 - Current: on the walk, run from an external drive with a 3.5 GB pipeline archive: resident 10.9-11.4 GB, wired about 9.4 GB, on a 16 GB Mac. `vmmap` and `footprint`: 6.4 GB of guest memory and 3.8 GB of Metal textures and targets, 1 GB of IOAccelerator memory. [Reading the archive into memory](../../../docs/reference/memory.md#a-pipeline-archive-on-an-external-drive-is-read-into-memory) used to add 3.5 GB (footprint 15.0, peak 16.7). `mem_map_limit on`: a map past the application pool fails as on Horizon, and the SDK's allocator then gives back the pages it keeps. Other apps' memory adds to the swap: other games running beside it can push the Mac over.
