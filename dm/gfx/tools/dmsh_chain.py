@@ -10,7 +10,7 @@
 #       dmsh_chain.py --header        rewrite dm/gfx/nvn/dmsh_chain.h (run after changing any file listed above, and commit it with the change)
 #       dmsh_chain.py --inputs        print the digest of the current game profile's inputs (DM_GAME), as b-<V>/inputs.tsv records it
 #       (checking the tools against dmsh_chain.lock, and rewriting it, is tool_lock.py's: the checks decide no output, so they are outside V and the shaders' cache keys)
-# Environment: XLATE_DEBUG / XLATE_REDUCED / DMSH_F32_ATOMIC / DMSH_LOOP_CAP / DMSH_MESH_TRIM (same meaning as in dmsh_build.py, default 1 / 1 / native / 65536 / 1; non-default options yield a different V, which the host will not load)
+# Environment: XLATE_DEBUG / XLATE_REDUCED / DMSH_F32_ATOMIC / DMSH_LOOP_CAP / DMSH_LOOP_CAP_KEYS / DMSH_MESH_TRIM (same meaning as in dmsh_build.py, default 1 / 1 / native / 0 / see loop_cap_keys / 1; non-default options yield a different V, which the host will not load)
 import os, sys, ast, hashlib
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # Workspace root (game files, build outputs and run artifacts are all under it)
 HERE = os.path.dirname(os.path.abspath(__file__)); GFX = os.path.dirname(HERE); HOME = os.path.expanduser('~')
