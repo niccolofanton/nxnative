@@ -12465,14 +12465,15 @@ static int up_chain_role(NvShader *cs) {   // 1 a stage before the last (2: the 
 
 // Ocarina's NDVE movie path converts NV12 to RGBA before reconstruction. The final
 // movie dispatch can scale that clean image directly into its normal output.
+// DM_NVN_NDVE_MOVIE_DIRECT=1 does only that; =2 also leaves out the network between the two (ndve_net_skip)
 static int ndve_direct_draw(NvShader *cs);
+static int ndve_mode(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_NVN_NDVE_MOVIE_DIRECT"); v = !e ? 0 : !strcmp(e, "1") ? 1 : !strcmp(e, "2") ? 2 : 0; }
+    return v;
+}
 static int ndve_direct_role(NvShader *cs) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *e = getenv("DM_NVN_NDVE_MOVIE_DIRECT");
-        enabled = e && !strcmp(e, "1");
-    }
-    if (!enabled) return 0;
+    if (!ndve_mode()) return 0;
     if (!strcmp(cs->key, "49dff010b9832251_b")) return 1;
     if (!strcmp(cs->key, "4f41ccf24f163e0d_b")) return 2;
     return 0;
@@ -12501,6 +12502,45 @@ static id<MTLTexture> ndve_image(NvShader *cs, unsigned slot, tex_t *desc) {
     if (result.textureType != MTLTextureType2D || result.pixelFormat != MTLPixelFormatRGBA8Unorm || result.sampleCount != 1) return nil;
     return result;
 }
+// DM_NVN_NDVE_MOVIE_DIRECT=2: with the final dispatch replaced by the direct draw, the network's dispatches between the conversion and it only feed what is thrown away, and they
+// are nearly all of the movie's GPU time (title and opening movie GPU-bound at ~54 ms a frame on an M1 Pro; the network alone 15.4 ms on an M6, 35 ms on an M1 Max, issue 1375).
+// The list: the #NDVE@ compute shaders of Movie/Ndve/Ndve-Nvn2-vid_seq5.dat.zs in the profile's shader_map.tsv, but the conversion (49dff010b9832251). The NDSR pack's two
+// (c2fc2ddd604c25e7, and 4f41ccf24f163e0d, the final dispatch) are left out: what c2fc2ddd writes is not known to be the network's alone. Only these keys are skipped, only after a
+// conversion in the same submission (g_ndve_decoded: set by it, cleared by the final dispatch and mtl_sub_begin), and only once a direct draw has succeeded (g_ndve_latch), as a
+// skipped dispatch cannot be re-run if the draw then fails. A skipped dispatch encodes nothing, so the barrier records (g_bw_*), image_prepare and argument dirtiness of the next
+// one are those of the last dispatch that ran, as for a dispatch the host refuses (no pipeline)
+static const char g_ndve_net[][17] = {
+    "ba079f68ae288dba", "a8b4fb48fee0ccf8", "e2eebd7ba18fe35f", "e6be82d835fbe4d3", "9442573ee4ace011", "0a56002cdc7e1fce", "d15370a382630d4e", "7f7ff0f36b54d90f", "5a7d69b067a7f011", "329e4b0f0b3f2bc6",
+    "7653fe5f6ef0b2f2", "b6e34b46dea44278", "3f18f89630c05813", "539ad3b353758de0", "d72077c4b6cc264f", "ab9a92b55950ec02", "c41f451b88a050f6", "55ee6dc89a2b64e2", "8e98d86c0e4a7b53",
+};
+#define NDVE_WIN 64   // slack past the conversion-to-final span seen on the latching frame: a final dispatch that has not come by then is not the order seen, and skipping stops for the run
+static int g_ndve_latch;   // 1: a direct draw succeeded (skipping allowed); 0: not yet, or the last one failed; -1: off for the run (the safety valve)
+static unsigned g_ndve_span;   // dispatches between the conversion and the final one on the frame that latched (the whole network ran)
+static unsigned g_ndve_win, g_ndve_skip, g_ndve_ran, g_ndve_keys;   // since the last conversion: dispatches seen, skipped, run; skipped shaders (a bit per g_ndve_net entry)
+static void ndve_net_reset(void) { g_ndve_win = g_ndve_skip = g_ndve_ran = g_ndve_keys = 0; }
+static int ndve_net_skip(NvShader *cs) {
+    if (g_ndve_latch < 0 || !g_ndve_decoded || ndve_mode() != 2) return 0;
+    g_ndve_win++;   // counted on the full frames too: the latching one gives g_ndve_span
+    if (!g_ndve_latch) return 0;
+    if (g_ndve_win > g_ndve_span + NDVE_WIN) {
+        g_ndve_latch = -1;
+        MLOG("[RED] NDVE movie (DM_NVN_NDVE_MOVIE_DIRECT=2): no final dispatch within %u dispatches of the conversion (%u seen when it latched, %u skipped): network skipping off for the run", g_ndve_win - 1, g_ndve_span, g_ndve_skip);
+        return 0;
+    }
+    for (unsigned i = 0; i < sizeof g_ndve_net / sizeof *g_ndve_net; i++)
+        if (!strncmp(cs->key, g_ndve_net[i], 16)) { g_ndve_skip++; g_ndve_keys |= 1u << i; return 1; }
+    g_ndve_ran++;
+    return 0;
+}
+static void ndve_net_done(int ok) {   // the final dispatch's direct draw, mode 2
+    if (ok) {
+        if (!g_ndve_latch) { g_ndve_latch = 1; g_ndve_span = g_ndve_win; }
+        static int once; if (g_ndve_skip && !once++) MLOG("NDVE movie (DM_NVN_NDVE_MOVIE_DIRECT=2): network skipped, %u dispatches of %d shaders left out between the conversion and the final scale, %u other dispatches ran there", g_ndve_skip, __builtin_popcount(g_ndve_keys), g_ndve_ran);
+    } else if (g_ndve_latch > 0) {
+        g_ndve_latch = 0;   // the next frame runs the whole network, and skips again once a direct draw succeeds
+        static int once; if (g_ndve_skip && !once++) MLOG("[RED] NDVE movie (DM_NVN_NDVE_MOVIE_DIRECT=2): the direct draw failed after %u network dispatches were skipped: the game's final dispatch ran on stale inputs this frame", g_ndve_skip);
+    }
+}
 static void dispatch(const p_dispatch *dp) {
     zskip_clear();
     g_wr_epoch++; g_mdx_epoch++;
@@ -12523,12 +12563,15 @@ static void dispatch(const p_dispatch *dp) {
           if (nsk) MLOG("DM_NVN_SKIP_CS: dropping the dispatches of %zu compute shaders (diagnostic; the picture is wrong)", nsk); }
       if (nsk && cs->key[0]) { uint64_t v = strtoull(cs->key, NULL, 16); for (size_t i = 0; i < nsk; i++) if (sk[i] == v) { static uint64_t nd; if (!nd++) MLOG("DM_NVN_SKIP_CS: first dispatch dropped: %s", cs->key); return; } } }
     int ndve = !dp->ind && dp->x && dp->y && dp->z == 1 ? ndve_direct_role(cs) : 0;
-    if (ndve == 1) g_ndve_decoded = nil;
+    if (ndve == 1) { g_ndve_decoded = nil; ndve_net_reset(); }
     if (ndve == 2 && g_ndve_decoded) {
         rp_flush();
         image_prepare(program, 0x20);
-        if (ndve_direct_draw(cs)) return;
+        int ok = ndve_direct_draw(cs);
+        if (ndve_mode() == 2) ndve_net_done(ok);
+        if (ok) return;
     }
+    if (g_ndve_decoded && ndve_net_skip(cs)) return;   // before the pipeline lookup: nothing of a skipped dispatch is built or encoded
     const void *k = (__bridge const void *)cs;
     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
     if (!ps) {
