@@ -143,6 +143,9 @@ HLE_FORCE("_ZN2nn2vi31QueryDisplayBufferMaxResolutionEPNS0_19BufferMaxResolution
         if (w < h) { int t = w; w = h; h = t; }
         r = 0; for (uint32_t i = 0; i < 4; i++) if (w >= k[i][0] && h >= k[i][1]) r = i;
     }
+    // DM_VI_MAX_RES=0..3 forces the answer (0 720p, 1 1080p, 2 1440p, 3 2160p): a game that sizes its output from it (Ocarina: 2048x1152 at 1440p) renders fewer pixels
+    const char *f = getenv("DM_VI_MAX_RES");
+    if (f && *f >= '0' && *f <= '3' && !f[1]) r = (uint32_t)(*f - '0');
     static atomic_int once; if (!atomic_exchange(&once, 1)) LOG("vi::QueryDisplayBufferMaxResolution: %dx%d (%s, display %dx%d)", k[r][0], k[r][1], dm_opmode() == 1 ? "docked" : "handheld", w, h);
     if (out) *out = r; return RES_OK;
 }
