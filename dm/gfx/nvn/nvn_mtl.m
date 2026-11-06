@@ -12468,8 +12468,9 @@ static int up_chain_role(NvShader *cs) {   // 1 a stage before the last (2: the 
 // DM_NVN_NDVE_MOVIE_DIRECT=1 does only that; =2 also leaves out the network between the two (ndve_net_skip)
 static int ndve_direct_draw(NvShader *cs);
 static int ndve_mode(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("DM_NVN_NDVE_MOVIE_DIRECT"); v = !e ? 0 : !strcmp(e, "1") ? 1 : !strcmp(e, "2") ? 2 : 0; }
+    // Read again every 256 dispatches so a DM_CTL "env DM_NVN_NDVE_MOVIE_DIRECT=…" line switches it mid-run (an A/B on the same movie frames); getenv is cheap at ~20 dispatches a frame
+    static int v = -1; static unsigned n;
+    if (v < 0 || !(n++ & 255)) { const char *e = getenv("DM_NVN_NDVE_MOVIE_DIRECT"); v = !e ? 0 : !strcmp(e, "1") ? 1 : !strcmp(e, "2") ? 2 : 0; }
     return v;
 }
 static int ndve_direct_role(NvShader *cs) {
@@ -14220,13 +14221,16 @@ static up_mfx_scaler g_up_mfx[UP_MFX_SCALERS]; static int g_up_mfx_next;
 static uint64_t g_up_mfx_n, g_up_mfx_kept;   // dispatches drawn by MetalFX, dispatches of a named shader left to it
 void mtl_up_mfx_stats(uint64_t *n, uint64_t *kept) { *n = g_up_mfx_n; *kept = g_up_mfx_kept; }
 static int up_mfx_on(void) {
-    static int v = -1;
-    if (v >= 0) return v;
-    const char *e = getenv("DM_UPSCALER"); v = e && !strcmp(e, "metalfx");
-    if (e && *e && strcmp(e, "metalfx") && strcmp(e, "game")) MLOG("[RED] DM_UPSCALER=%s: metalfx or game; keeping the game's", e);
-    if (v && !(g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev])) { MLOG("upscaler: this GPU has no Metal 4 MetalFX spatial scaler; the game's own upscaler draws"); v = 0; }
-    if (v) MLOG("upscaler (DM_UPSCALER): metalfx, the game's upscaler shaders (%d, from the shader map) are drawn by MetalFX's spatial scaler", DM_GAME_UPSCALER_N);
-    return v;
+    // Read again every 256 calls so a DM_CTL "env DM_UPSCALER=…" line switches it mid-run (an A/B on the same scene); the GPU support check runs once
+    static int v = -1, sup = -1; static unsigned n;
+    if (v >= 0 && (n++ & 255)) return v;
+    const char *e = getenv("DM_UPSCALER"); int w = e && !strcmp(e, "metalfx");
+    if (v < 0 && e && *e && strcmp(e, "metalfx") && strcmp(e, "game")) MLOG("[RED] DM_UPSCALER=%s: metalfx or game; keeping the game's", e);
+    if (w && sup < 0) { sup = g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev]; if (!sup) MLOG("upscaler: this GPU has no Metal 4 MetalFX spatial scaler; the game's own upscaler draws"); }
+    if (w && !sup) w = 0;
+    if (w != v && (w || v > 0)) MLOG("upscaler (DM_UPSCALER): %s", w ? "metalfx, the game's upscaler shaders are drawn by MetalFX's spatial scaler" : "the game's own");
+    if (w && v < 0) MLOG("upscaler: %d game upscaler shaders from the shader map", DM_GAME_UPSCALER_N);
+    return v = w;
 }
 // The colour a variant of the network takes and writes, from the sRGB curves in its code (their constants are immediates, whole bytes in the code). The variants differ inside a pack, so this is the shader's and not the game's:
 // Bananza's all encode linear input (0.0031308, 1 / 2.4 as floats) and come in threes: no decode at the end (the output stays encoded), a decode clamped to 0-1, a decode up to 128. Splatoon Raiders' all read colour that is encoded
@@ -14253,16 +14257,16 @@ static int up_mfx_named(NvShader *cs) {
     return 0;
 }
 static void up_mfx_read_color(NvShader *cs, const NVNshaderData *sd) {
-    if (cs->up_color || !DM_GAME_UPSCALER_N || !up_mfx_on() || !up_mfx_named(cs)) return;
+    if (cs->up_color || !DM_GAME_UPSCALER_N || !up_mfx_named(cs)) return;   // read even with MetalFX off, so a DM_CTL switch to it mid-run finds the colour shape
     uint32_t nctl, ncode = 0; if (sd->control) nvn_ctl_lens(sd->control, &nctl, &ncode);
     cs->up_color = sd->data && ncode && ncode < (1u << 24) ? up_mfx_color((const void *)(uintptr_t)sd->data, ncode) : UP_COLOR_KEEP;
     MLOG("upscaler %s: %s", cs->key, cs->up_color == UP_COLOR_LINEAR ? "linear input and output, MetalFX in HDR mode" : cs->up_color == UP_COLOR_SRGB ? "sRGB-encoded input, linear output, MetalFX in perceptual mode" : "neither of the colour shapes MetalFX draws; the game's shader runs");
 }
 // Whether cs is one of the game's upscaler shaders, the player chose MetalFX and its colour is one MetalFX draws
 static int up_mfx_wanted(NvShader *cs) {
+    if (!DM_GAME_UPSCALER_N || !up_mfx_on()) return 0;   // asked each time: DM_UPSCALER can change mid-run (DM_CTL env); whether the shader qualifies is kept
     if (cs->up_mfx) return cs->up_mfx == 1;
     cs->up_mfx = 2;
-    if (!DM_GAME_UPSCALER_N || !up_mfx_on()) return 0;
     if (up_mfx_named(cs) && (cs->up_color == UP_COLOR_LINEAR || cs->up_color == UP_COLOR_SRGB)) cs->up_mfx = 1;
     return cs->up_mfx == 1;
 }
