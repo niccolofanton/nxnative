@@ -5161,7 +5161,7 @@ typedef struct { int8_t fx[32]; uint8_t fbmask, lmap[8]; } bf_key;
 @interface NvProg : NSObject { @public NvShader *sh[6]; char gs_miss[17]; NvProg *geo_raster, *geo_lean_raster; int8_t c_sw, c_iw, c_img; } @end   // c_sw / c_iw / c_img: prog_swrites, udc_note_draw's image write, image_prepare's written image slots; + 1 once known (the shaders are fixed once made)   // geo_raster: GS output reader paired with this program's fragment stage; geo_lean_raster: its own vertex and fragment stages (a lean passthrough kernel)
 @implementation NvProg @end
 // Warm-up entry: built in the background, waiting to be taken by the submit thread. vs / fs are strong references (in pso they are only raw pointers, and the background dictionary is released when the task ends)
-@interface WarmItem : NSObject { @public int kind, record; NSString *key, *vs_key, *fs_key; NvShader *shader, *vs, *fs; pso_key pso; id<MTLFunction> fsfn; id object; } @end   // record: a prefetched library, written to the prewarm lists when claimed (shader_get's lines)
+@interface WarmItem : NSObject { @public int kind, record; NSString *key, *vs_key, *fs_key, *ts_key; NvShader *shader, *vs, *fs, *ts; pso_key pso; id<MTLFunction> fsfn; id object; } @end   // record: a prefetched library, written to the prewarm lists when claimed (shader_get's lines)
 @implementation WarmItem @end
 static NSMutableDictionary<NSString *, NvShader *> *g_shcache;
 
@@ -5209,8 +5209,8 @@ static os_unfair_lock g_warm_lock = OS_UNFAIR_LOCK_INIT;
 static _Atomic int g_warm_ready;
 static uint64_t g_warm_t0;
 static _Atomic int g_warm_running;   // Background warm-up has not finished yet (the loading screen on entering a run waits a little longer based on this, see mtl_warm_wait)
-static _Atomic uint64_t g_warm_shaders, g_warm_rps, g_warm_cps, g_warm_skip_fz, g_warm_skip_stale;   // the prewarm's workers count into them
-static uint64_t g_warm_claim_shaders, g_warm_claim_rps, g_warm_claim_cps;
+static _Atomic uint64_t g_warm_shaders, g_warm_rps, g_warm_mps, g_warm_mps_arch, g_warm_cps, g_warm_skip_fz, g_warm_skip_stale;   // the prewarm's workers count into them (mps: task / mesh pipelines, _arch: from the archive)
+static uint64_t g_warm_claim_shaders, g_warm_claim_rps, g_warm_claim_cps, g_warm_claim_mps;
 static id<MTLFunction> bf_fn(NvShader *fs, const int *fx, uint8_t fbmask, const uint8_t *lmap);
 static int rt_range_bindings_ro(NSDictionary *j);
 static FILE *g_pso_record; static int g_pso_record_checked;
@@ -8130,6 +8130,47 @@ static int pso_prebuild(int threads, int wait, dispatch_qos_class_t qos) {
     else dispatch_group_notify(g, dispatch_get_global_queue(qos, 0), done);
     return n;
 }
+static id<MTLRenderPipelineState> mtk_build(const pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs, NSError **e, int *found);   // nvn_geometry.inc
+static void mtk_key(pso_key *k, NvShader *ts, NvShader *ms, NvShader *fs);
+// DM_PSO_MESH_PREWARM=0: the prewarm and the prebuild tool leave the M rows (task / mesh pipelines) out, and each is built in the background at its first draw, which is left out until then
+static int mesh_prewarm_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_PSO_MESH_PREWARM"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_PSO_MESH_PREWARM=0: no prewarm of task / mesh pipelines (M rows)"); }
+    return v;
+}
+static NSString *warm_key(const char *s, size_t n);
+static NSString *warm_map_stage(NSString *key);
+// The prebuild tool's task / mesh pipelines: the M rows of the profile's pso_manifest.tsv and of pso_user.tsv, into the archive through the Metal 4 compiler (mtk_build; those already
+// there are only looked up), so the prepare step takes them from it. Off with DM_PSO_MESH_PREWARM=0
+static void pso_prebuild_mesh(void) {
+    shmap_load(); pso4_init();
+    if (!g_arch_cap || !mesh_prewarm_on()) return;
+    NSMutableOrderedSet<NSString *> *rows = [NSMutableOrderedSet orderedSet];
+    NSString *seed = [g_shmap_path.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"pso_manifest.tsv"], *user = pso_user_path();
+    for (NSString *p in @[seed, user ?: @""]) {
+        NSString *txt = p.length ? [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil] : nil;
+        for (NSString *l in [txt componentsSeparatedByString:@"\n"]) if ([l hasPrefix:@"M\t"]) [rows addObject:l];
+    }
+    if (!rows.count) return;
+    NSArray<NSString *> *list = rows.array; uint64_t t0 = bp_now(); __block _Atomic int built = 0, archived = 0, failed = 0, skipped = 0;
+    MLOG("pipeline prebuild: %lu task / mesh pipelines of the prewarm lists", (unsigned long)list.count);
+    dispatch_apply(list.count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i) { @autoreleasepool {
+        NSArray<NSString *> *c = [list[i] componentsSeparatedByString:@"\t"]; pso_skey sk;
+        if (c.count < 3 || pso_mesh_skey_parse(c[2].UTF8String, &sk)) { skipped++; return; }
+        NSString *mk = warm_key(sk.vs, sizeof sk.vs), *fk = warm_key(sk.fs, sizeof sk.fs), *tk = [c[1] isEqualToString:@"-"] || !c[1].length ? nil : c[1];
+        if (!warm_map_stage(mk) || (fk.length && !warm_map_stage(fk)) || (tk && !warm_map_stage(tk))) { skipped++; return; }   // another version of the game
+        NvShader *ms = shader_load(mk, 4, 0), *fs = fk.length ? shader_load(fk, 1, 0) : nil, *ts = tk ? shader_load(tk, 3, 0) : nil;
+        if (!ms || ms->mesh_kind != 2 || !ms->fn || (fk.length && !fs) || (ts ? ts->mesh_kind != 1 || !ts->fn : !ms->mesh_notask)) {
+            failed++; MLOG("[RED] pipeline prebuild: task / mesh pipeline of mesh %s: its shaders did not load as task / mesh / pixel shaders", mk.UTF8String); return; }
+        pso_key k = sk.k; mtk_key(&k, ts, ms, fs); NSError *e = nil; int found = 0;
+        id ps = mtk_build(&k, ts, ms, fs, &e, &found);
+        if (ps) { if (found) archived++; else built++; }
+        else { failed++; MLOG("[RED] pipeline prebuild: task / mesh pipeline (task %s mesh %s fragment %s) failed: %s", tk ? tk.UTF8String : "-", mk.UTF8String, fk.length ? fk.UTF8String : "-", e.localizedDescription.UTF8String); }
+    } });
+    arch_flush_wait();
+    MLOG("pipeline prebuild done: %lu task / mesh pipelines, %d built, %d already archived, %d failed, %d not for this shader map, %.1f s",
+         (unsigned long)list.count, (int)built, (int)archived, (int)failed, (int)skipped, (bp_now() - t0) / 1e9);
+}
 // DM_PSO_PREBUILD=tool: the prebuild alone (the host's other environment as for a run: DM_NVN_SHMAP, DM_MSL_DIR, DM_SAVE or DM_PSO_ARCHIVE), then exit; DM_PSO_PREBUILD_DEPTH=zero for
 // a game that sets the near=0 depth mode, DM_PSO_PREBUILD_THREADS=<n> workers (default: compile_tasks). Returns 0 when not asked for
 int mtl_pso_prebuild_tool(void) {
@@ -8139,6 +8180,7 @@ int mtl_pso_prebuild_tool(void) {
     int threads = getenv("DM_PSO_PREBUILD_THREADS") ? atoi(getenv("DM_PSO_PREBUILD_THREADS")) : 0;
     if (threads <= 0) threads = compile_tasks();
     if (pso_prebuild(threads, 1, QOS_CLASS_USER_INITIATED) < 0) MLOG("pipeline prebuild: nothing to do (no archive, no shader_pairs.tsv, prebuilt.tsv says it is done, or the archive bundled with the app holds every base)");
+    pso_prebuild_mesh();
     return 1;
 }
 static int prepare_on(void);
@@ -8266,10 +8308,10 @@ static NSString *warm_key(const char *s, size_t n) {
     size_t z = strnlen(s, n);
     return [[NSString alloc] initWithBytes:s length:z encoding:NSUTF8StringEncoding];
 }
-// The prewarm runs the lines of its lists as tasks: a shader (S), a compute pipeline (C), or every render pipeline (R) of one shader pair. The pipelines of a pair share their
+// The prewarm runs the lines of its lists as tasks: a shader (S), a compute pipeline (C), every render pipeline (R) of one shader pair, or a task / mesh pipeline (M). The pipelines of a pair share their
 // bases, so one worker builds them one after the other and no two workers compile the same base. The tasks keep the lists' order (a pair at its first line).
 // Shaders share one dictionary. Only one worker prepares a key, including its pulling entry; a failed warm load stays NSNull for this prewarm only.
-@interface WarmTask : NSObject { @public int kind, stage; NSString *key, *vkey, *fkey; NSMutableArray<NSData *> *rs; } @end
+@interface WarmTask : NSObject { @public int kind, stage; NSString *key, *vkey, *fkey, *tkey; NSMutableArray<NSData *> *rs; } @end   // kind 3 (M): vkey the mesh shader, tkey the task shader or nil
 @implementation WarmTask @end
 static NSMutableDictionary *g_warm_dict; static os_unfair_lock g_warm_dict_lock = OS_UNFAIR_LOCK_INIT;
 @interface WarmLoad : NSObject { @public dispatch_group_t done; id shader; } @end
@@ -8282,9 +8324,12 @@ static _Atomic long g_warm_done;   // lines done (the prepare screen's count)
 // A prewarm list may name shaders of another version of the game: the bundled list of the version the profile was brought up on, packed with another version (the NSP script's
 // derived profile: Hollow Knight: Silksong's 1.0.30000 list named 16 shaders its base game 1.0.27776 does not have), or a device's pso_user.tsv kept across a game update.
 // A line with a key the shader map does not have is dropped quietly (the keys are counted in the "prewarm done" line); the game never draws with it
-static int warm_stale(NSString *key, NSMutableSet<NSString *> *stale) {
+static NSString *warm_map_stage(NSString *key) {   // the shader map's stage of a key ("vertex", "mesh", ...), nil when the map does not have it
     NSString *mk = [key hasSuffix:@"_b"] ? [key substringToIndex:key.length - 2] : key;   // library names are <map key>_b
-    if (g_shmap[mk]) return 0;
+    return g_shmap[mk];
+}
+static int warm_stale(NSString *key, NSMutableSet<NSString *> *stale) {
+    if (warm_map_stage(key)) return 0;
     if (![stale containsObject:key]) { [stale addObject:key]; g_warm_skip_stale++; }
     return 1;
 }
@@ -8347,6 +8392,18 @@ static NSArray<WarmTask *> *warm_parse(NSArray<NSString *> *paths, long *lines) 
                 t = pairs[pk];
                 if (!t) { t = [WarmTask new]; t->kind = 1; t->vkey = vkey; t->fkey = fkey; t->rs = [NSMutableArray array]; pairs[pk] = t; [tasks addObject:t]; }
                 [t->rs addObject:kd];
+            } else if ([c[0] isEqualToString:@"M"] && c.count >= 3) {   // M<TAB>task shader key or -<TAB>pso_skey hex, the mesh shader in the vertex place
+                if (!mesh_prewarm_on()) continue;
+                pso_skey sk; if (pso_mesh_skey_parse(c[2].UTF8String, &sk)) continue;
+                NSData *kd = [NSData dataWithBytes:&sk length:sizeof sk]; NSString *tkey = [c[1] isEqualToString:@"-"] || !c[1].length ? nil : c[1];
+                NSMutableData *mk = [kd mutableCopy]; [mk appendData:[(tkey ?: @"-") dataUsingEncoding:NSUTF8StringEncoding]];   // one task / mesh pipeline: its key and its task shader
+                if ([seen_k containsObject:mk]) continue;
+                [seen_k addObject:mk];
+                NSString *vkey = warm_key(sk.vs, sizeof sk.vs), *fkey = warm_key(sk.fs, sizeof sk.fs);
+                if (warm_stale(vkey, stale) || (fkey.length && warm_stale(fkey, stale)) || (tkey && warm_stale(tkey, stale))) continue;
+                // warm_shader keeps one shader per key whatever stage it was asked for: a row whose keys are not of the stages it names is left out before it can load one
+                if (![warm_map_stage(vkey) isEqualToString:@"mesh"] || (fkey.length && ![warm_map_stage(fkey) isEqualToString:@"pixel"]) || (tkey && ![warm_map_stage(tkey) isEqualToString:@"task"])) continue;
+                t = [WarmTask new]; t->kind = 3; t->vkey = vkey; t->fkey = fkey; t->tkey = tkey; t->rs = [NSMutableArray arrayWithObject:kd]; [tasks addObject:t];
             } else continue;
             n++;
         }
@@ -8364,6 +8421,18 @@ static void warm_task(WarmTask *t) {
             NvShader *cs = warm_shader(t->key, 5); NSError *e = nil; id ps = cs ? cps_make(cs, &e) : nil;
             if (cs && !ps) MLOG("[RED] background compute pipeline creation failed: %s", e.localizedDescription.UTF8String);
             if (ps) { WarmItem *item = [WarmItem new]; item->kind = 2; item->key = t->key; item->shader = cs; item->object = ps; warm_enqueue(item); g_warm_cps++; }
+            g_warm_done++; return;
+        }
+        if (t->kind == 3) {   // a task / mesh pipeline, with the shaders its draw checks for (mesh_tasks_draw)
+            pso_skey sk; [t->rs[0] getBytes:&sk length:sizeof sk];
+            NvShader *ms = warm_shader(t->vkey, 4), *fs = t->fkey.length ? warm_shader(t->fkey, 1) : nil, *ts = t->tkey ? warm_shader(t->tkey, 3) : nil;
+            if (ms && ms->mesh_kind == 2 && ms->fn && (!t->fkey.length || (fs && fs->fn)) && (ts ? ts->mesh_kind == 1 && ts->fn : ms->mesh_notask)) {
+                pso_key k = sk.k; mtk_key(&k, ts, ms, fs); NSError *e = nil; int found = 0;
+                id<MTLRenderPipelineState> ps = mtk_build(&k, ts, ms, fs, &e, &found);
+                if (ps) { WarmItem *item = [WarmItem new]; item->kind = 3; item->vs_key = t->vkey; item->fs_key = t->fkey; item->ts_key = t->tkey; item->vs = ms; item->fs = fs; item->ts = ts;
+                          item->pso = k; item->object = ps; warm_enqueue(item); g_warm_mps++; g_warm_mps_arch += found; }
+                else MLOG("[RED] background task / mesh pipeline creation failed: task %s mesh %s fragment %s: %s", ts ? ts->key : "-", ms->key, fs ? fs->key : "-", e.localizedDescription.UTF8String);
+            }
             g_warm_done++; return;
         }
         pso_skey sk; [t->rs[0] getBytes:&sk length:sizeof sk];
@@ -8388,8 +8457,9 @@ static void warm_task(WarmTask *t) {
     }
 }
 static void warm_finish(void) {
-    MLOG("pipeline prewarm done: shaders %llu / render pipelines %llu (specialized fragment skipped %llu) / compute pipelines %llu, background time %.1f ms; shader keys not in the shader map (another game version) %llu",
-         (unsigned long long)g_warm_shaders, (unsigned long long)g_warm_rps, (unsigned long long)g_warm_skip_fz, (unsigned long long)g_warm_cps, (bp_now() - g_warm_t0) / 1e6, (unsigned long long)g_warm_skip_stale);
+    MLOG("pipeline prewarm done: shaders %llu / render pipelines %llu (specialized fragment skipped %llu) / compute pipelines %llu / task / mesh pipelines %llu (%llu from the archive), background time %.1f ms; shader keys not in the shader map (another game version) %llu",
+         (unsigned long long)g_warm_shaders, (unsigned long long)g_warm_rps, (unsigned long long)g_warm_skip_fz, (unsigned long long)g_warm_cps, (unsigned long long)g_warm_mps, (unsigned long long)g_warm_mps_arch,
+         (bp_now() - g_warm_t0) / 1e6, (unsigned long long)g_warm_skip_stale);
     if (g_comp4) MLOG("pipeline bases so far: %llu compiled, %llu from the archive, %llu reused (%.1f ms for the bases); %llu specializations (their descriptors %s), %llu pipelines without a base (MTLDevice)",
                       (unsigned long long)g_pb_built, (unsigned long long)g_pb_archived, (unsigned long long)g_pb_reused, g_pb_base_ns / 1e6, (unsigned long long)g_pb_spec,
                       (const char *[]){"not asked for yet", "returned retained", "returned autoreleased"}[atomic_load(&g_spec_own) % 3], (unsigned long long)g_pb_legacy);
@@ -8445,9 +8515,9 @@ static void warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
         if (shown) front_progress("Preparing shaders", g_warm_done, lines);
     }
     if (shown) front_progress(NULL, lines, lines);
-    MLOG("pipeline prepare: %ld lines (%llu shaders, %llu render pipelines, %llu compute pipelines) in %.2f s on %d workers before the first frame, progress screen %s; "
+    MLOG("pipeline prepare: %ld lines (%llu shaders, %llu render pipelines, %llu compute pipelines, %llu task / mesh pipelines) in %.2f s on %d workers before the first frame, progress screen %s; "
          "bases %llu compiled, %llu from the archive, %llu reused; %llu specializations",
-         lines, (unsigned long long)g_warm_shaders, (unsigned long long)g_warm_rps, (unsigned long long)g_warm_cps, (bp_now() - t0) / 1e9, workers, shown ? "shown" : "not shown",
+         lines, (unsigned long long)g_warm_shaders, (unsigned long long)g_warm_rps, (unsigned long long)g_warm_cps, (unsigned long long)g_warm_mps, (bp_now() - t0) / 1e9, workers, shown ? "shown" : "not shown",
          (unsigned long long)(g_pb_built - built0), (unsigned long long)(g_pb_archived - arch0), (unsigned long long)(g_pb_reused - reused0), (unsigned long long)(g_pb_spec - spec0));
 }
 // The prebuild in the prepare step: the bases of every shader pair are made before the game's first frame, behind the progress screen ("Preparing pipelines"), once per chain
@@ -12592,6 +12662,15 @@ static void warm_claim(void) {
             if (item->fs_key.length && !fs) { fs = item->fs; g_shcache[item->fs_key] = fs; }
             item->pso.vs = (__bridge void *)vs; item->pso.fs = (__bridge void *)fs;
             if (!hm_get_id(&g_pso, &item->pso)) { hm_put_id(&g_pso, &item->pso, item->object); g_warm_claim_rps++; }
+        } else if (item->kind == 3) {
+            if (!g_shcache) g_shcache = [NSMutableDictionary dictionary];
+            NvShader *ms = g_shcache[item->vs_key], *fs = item->fs_key.length ? g_shcache[item->fs_key] : nil, *ts = item->ts_key ? g_shcache[item->ts_key] : nil;
+            if (!ms) { ms = item->vs; g_shcache[item->vs_key] = ms; }
+            if (item->fs_key.length && !fs) { fs = item->fs; g_shcache[item->fs_key] = fs; }
+            if (item->ts_key && !ts) { ts = item->ts; g_shcache[item->ts_key] = ts; }
+            // a draw loaded one of its shaders itself meanwhile: the pipeline is not kept under functions it was not built with, and the draw builds its own
+            if (ms == item->vs && fs == item->fs && ts == item->ts) { if (mtk_claim(&item->pso, item->object)) g_warm_claim_mps++; }
+            else { static int once; if (!once++) MLOG("pipeline prewarm: a task / mesh pipeline of mesh %s was left out: the draws loaded its shaders first (built again at its first draw)", item->vs_key.UTF8String); }
         } else {
             NvShader *cs = g_shcache[item->key];
             if (!cs) { cs = item->shader; if (!g_shcache) g_shcache = [NSMutableDictionary dictionary]; g_shcache[item->key] = cs; }
@@ -14835,9 +14914,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     g_present_n++;
     if (bootprof() && (g_present_n == 1 || g_present_n % 120 == 0)) {
         if (g_present_n == 1) g_bp_first_present = bp_now() - g_bp_t0;
-        MLOG("[bootprof] t=%.3f s present #%llu: metallibs loaded %llu / %.1f ms; pipelines created %llu / %.1f ms (all synchronous on the submit thread); prewarmed and used: shaders %llu / render pipelines %llu / compute pipelines %llu; "
+        MLOG("[bootprof] t=%.3f s present #%llu: metallibs loaded %llu / %.1f ms; pipelines created %llu / %.1f ms (all synchronous on the submit thread); prewarmed and used: shaders %llu / render pipelines %llu / compute pipelines %llu / task / mesh pipelines %llu (%llu built at a draw, %llu task / mesh draws left out meanwhile); "
              "texture uploads %.1f MB / %llu first uploads + %llu re-uploads / %.1f ms; first present t=%.3f s", (bp_now() - g_bp_t0) / 1e9, g_present_n,
-             g_bp_lib_n, g_bp_lib_ns / 1e6, g_bp_pso_n, g_bp_pso_ns / 1e6, g_warm_claim_shaders, g_warm_claim_rps, g_warm_claim_cps,
+             g_bp_lib_n, g_bp_lib_ns / 1e6, g_bp_pso_n, g_bp_pso_ns / 1e6, g_warm_claim_shaders, g_warm_claim_rps, g_warm_claim_cps, g_warm_claim_mps, g_mtk_built, g_mtk_wait,
              g_bp_up_bytes / 1048576.0, g_pkg_uploads, g_pkg_reuploads,
              g_up_total_ns / 1e6, g_bp_first_present / 1e9);
     }

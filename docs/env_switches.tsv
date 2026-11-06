@@ -288,6 +288,7 @@ DM_PSO_GPUS	switch	`build_ipa.sh`: the GPU architectures, comma-separated, to bu
 DM_PSO_HYBRID	switch	`0`: a draw whose pipeline is not built yet waits for it instead of drawing with its shader pair's pulling pipeline meanwhile (on by default with the Metal 4 path)
 DM_PSO_IOS_MIN	switch	`build_ipa.sh`: the minimum iOS version of the offline pipeline archives (default the SDK's major version); a device of another major version cannot open them and builds the bases itself
 DM_PSO_MANIFEST	path	The prewarm manifest to use instead of the profile's `pso_manifest.tsv`; `off` turns the prewarm off
+DM_PSO_MESH_PREWARM	switch	`0`: the prewarm and the prebuild tool leave out the `M` rows (task / mesh pipelines) of `pso_manifest.tsv` and `pso_user.tsv`; each is then built in the background at its first draw, whose draws are left out until it is ready (on by default: the prepare step builds them before the first frame, from the pipeline archive when the prebuild tool or an earlier start put them there)
 DM_PSO_MTL4	player	`0` builds render pipelines through the `MTLDevice` with no bases and no archive; `1` uses MTL4Compiler with the archive, hybrid pipelines and prebuild (default on on the Mac, the profile's `pso_mtl4` on iOS)
 DM_PSO_PAIRS	path	The prebuild's second shader pair table (default: `pso_pairs.tsv` beside the shader map)
 DM_PSO_PREBUILD	player	`0` turns off the prebuild of every known shader pair's pulling base into the pipeline archive (on by default); `tool` runs the prebuild alone on the Mac and exits

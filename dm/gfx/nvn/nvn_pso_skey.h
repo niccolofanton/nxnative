@@ -64,3 +64,11 @@ static inline int pso_skey_parse(const char *hex, pso_skey *out) {
     pso_key_norm(&out->k, out->merged);
     return 0;
 }
+
+// An M row's key (a task / mesh pipeline, nvn_geometry.inc mtk_pso): the mesh shader in the vertex place, the task shader in a column of its own; no vertex layout, no merged pass,
+// no specialized fragment. -1 when the row is not one
+static inline int pso_mesh_skey_parse(const char *hex, pso_skey *out) {
+    if (pso_skey_parse(hex, out) || !out->vs[0] || out->vs_stage != 4 || (out->fs[0] && out->fs_stage != 1) || out->merged || out->fz || !pso_ds_valid(out->k.dfmt, out->k.sfmt)) return -1;
+    memset(out->k.attr, 0, sizeof out->k.attr); memset(out->k.attr_hi, 0, sizeof out->k.attr_hi); memset(out->k.stream, 0, sizeof out->k.stream);
+    return 0;
+}
