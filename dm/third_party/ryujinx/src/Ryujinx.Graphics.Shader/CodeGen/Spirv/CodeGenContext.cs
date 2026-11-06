@@ -75,6 +75,9 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
         private readonly Dictionary<AstBlock, BlockState> _labels = new();
 
         public Dictionary<AstBlock, (Instruction, Instruction)> LoopTargets { get; set; }
+        // nxnative: the iteration counter of each loop of the current function (SpirvGenerator.DeclareLoopCounters), null when loops are not capped
+        public Dictionary<AstBlock, Instruction> LoopCounters { get; set; }
+        public uint LoopIterationCap { get; }
 
         public AstBlock CurrentBlock { get; private set; }
 
@@ -101,6 +104,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             HostCapabilities = parameters.HostCapabilities;
             Logger = parameters.Logger;
             TargetApi = parameters.TargetApi;
+            LoopIterationCap = parameters.LoopIterationCap;
 
             Delegates = new SpirvDelegates(this);
         }

@@ -10,7 +10,7 @@
 #       dmsh_chain.py --header        rewrite dm/gfx/nvn/dmsh_chain.h (run after changing any file listed above, and commit it with the change)
 #       dmsh_chain.py --inputs        print the digest of the current game profile's inputs (DM_GAME), as b-<V>/inputs.tsv records it
 #       (checking the tools against dmsh_chain.lock, and rewriting it, is tool_lock.py's: the checks decide no output, so they are outside V and the shaders' cache keys)
-# Environment: XLATE_DEBUG / XLATE_REDUCED / DMSH_F32_ATOMIC / DMSH_MESH_TRIM (same meaning as in dmsh_build.py, default 1 / 1 / native / 1; non-default options yield a different V, which the host will not load)
+# Environment: XLATE_DEBUG / XLATE_REDUCED / DMSH_F32_ATOMIC / DMSH_LOOP_CAP / DMSH_MESH_TRIM (same meaning as in dmsh_build.py, default 1 / 1 / native / 65536 / 1; non-default options yield a different V, which the host will not load)
 import os, sys, ast, hashlib
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # Workspace root (game files, build outputs and run artifacts are all under it)
 HERE = os.path.dirname(os.path.abspath(__file__)); GFX = os.path.dirname(HERE); HOME = os.path.expanduser('~')
@@ -22,7 +22,8 @@ FILES += ['../third_party/ryujinx/src/Ryujinx.Graphics.Shader/' + f for f in (
     'Translation/TranslationFlags.cs', 'Translation/HostCapabilities.cs',
     'Translation/Transforms/GeometryToCompute.cs', 'Translation/TranslatorContext.cs', 'Translation/Translator.cs', 'Translation/EmitterContext.cs', 'Translation/ShaderDefinitions.cs', 'CodeGen/Spirv/Instructions.cs',
     'StructuredIr/ShaderProperties.cs', 'Translation/Optimizations/BindlessElimination.cs', 'Translation/Optimizations/Optimizer.cs',
-    'Translation/Optimizations/GlobalToStorage.cs', 'CodeGen/Spirv/SpirvGenerator.cs', 'Instructions/InstEmitMemory.cs')]
+    'Translation/Optimizations/GlobalToStorage.cs', 'CodeGen/Spirv/SpirvGenerator.cs', 'Instructions/InstEmitMemory.cs',
+    'Translation/TranslationOptions.cs', 'CodeGen/CodeGenParameters.cs', 'CodeGen/Spirv/CodeGenContext.cs')]
 INPUT_TABLES = ['shader_facts.tsv', 'shader_map.tsv', 'shader_map.tsv.conflicts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv', 'bf_want.tsv', 'geo_mesh.tsv', 'dual_want.tsv']   # in the game profile folder
 OPTIONAL_TABLES = ['mesh_pairs.tsv']   # also inputs, but in the digest only where the profile has one: profiles without NVN2 mesh shaders keep their digest
 LOCK = os.path.join(HERE, 'dmsh_chain.lock'); HEADER = os.path.join(GFX, 'nvn/dmsh_chain.h')
@@ -39,6 +40,13 @@ def f32_atomic():
     if v not in ('native', 'cas'): sys.exit(f'[RED] DMSH_F32_ATOMIC={v}: expected native or cas')
     return v
 
+def loop_cap():
+    """The most times one entry into a loop runs its body (DMSH_LOOP_CAP, default 65536, 0 = no limit): a loop whose bound comes from memory that holds garbage then exits early
+    and shades a pixel wrong instead of hanging the GPU (Ocarina of Time's light-list loops in Kokiri). Part of the options, so each value has its own V and shader cache keys"""
+    v = os.environ.get('DMSH_LOOP_CAP', '65536')
+    if not v.isdigit() or int(v) >= 1 << 32: sys.exit(f'[RED] DMSH_LOOP_CAP={v}: expected an iteration count below 2^32 (0 = no limit)')
+    return int(v)
+
 def mesh_trim():
     """Whether a mesh shader hands Metal only the outputs its paired pixel shaders read (mesh_pairs.tsv; dmsh_meshstage.py widths): on by default, DMSH_MESH_TRIM=0 keeps every output a float4
     as before. Part of the options, so each choice has its own V and shader cache keys"""
@@ -47,7 +55,7 @@ def mesh_trim():
     return v == '1'
 
 def options():
-    return 'debug=%s reduced=%s f32_atomic=%s mesh_trim=%s' % (os.environ.get('XLATE_DEBUG', '1') != '0', os.environ.get('XLATE_REDUCED', '1') == '1', f32_atomic(), mesh_trim())
+    return 'debug=%s reduced=%s f32_atomic=%s loop_cap=%d mesh_trim=%s' % (os.environ.get('XLATE_DEBUG', '1') != '0', os.environ.get('XLATE_REDUCED', '1') == '1', f32_atomic(), loop_cap(), mesh_trim())
 
 def version():
     h = hashlib.sha256()

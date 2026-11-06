@@ -11,6 +11,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen
         public readonly HostCapabilities HostCapabilities;
         public readonly ILogger Logger;
         public readonly TargetApi TargetApi;
+        // nxnative: TranslationOptions.LoopIterationCap (0 = no limit)
+        public readonly uint LoopIterationCap;
 
         public CodeGenParameters(
             AttributeUsage attributeUsage,
@@ -18,7 +20,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen
             ShaderProperties properties,
             HostCapabilities hostCapabilities,
             ILogger logger,
-            TargetApi targetApi)
+            TargetApi targetApi,
+            uint loopIterationCap = 0)
         {
             AttributeUsage = attributeUsage;
             Definitions = definitions;
@@ -26,6 +29,7 @@ namespace Ryujinx.Graphics.Shader.CodeGen
             HostCapabilities = hostCapabilities;
             Logger = logger;
             TargetApi = targetApi;
+            LoopIterationCap = loopIterationCap;
         }
     }
 }

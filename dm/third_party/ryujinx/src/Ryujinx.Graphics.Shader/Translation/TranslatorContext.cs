@@ -370,7 +370,7 @@ namespace Ryujinx.Graphics.Shader.Translation
                 GpuAccessor.QueryHostSupportsViewportMask(),
                 Options.Flags.HasFlag(TranslationFlags.MetalImageAtomics));
 
-            CodeGenParameters parameters = new CodeGenParameters(attributeUsage, definitions, resourceManager.Properties, hostCapabilities, GpuAccessor, Options.TargetApi);
+            CodeGenParameters parameters = new CodeGenParameters(attributeUsage, definitions, resourceManager.Properties, hostCapabilities, GpuAccessor, Options.TargetApi, Options.LoopIterationCap);
 
             return Options.TargetLanguage switch
             {

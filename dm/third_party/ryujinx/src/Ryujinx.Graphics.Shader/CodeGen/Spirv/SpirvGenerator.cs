@@ -195,6 +195,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
             Declarations.DeclareLocals(context, function);
 
+            DeclareLoopCounters(context, function.MainBlock);
+
             Generate(context, function.MainBlock);
 
             // Functions must always end with a return.
@@ -326,6 +328,46 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
             }
         }
 
+        // nxnative: loop iteration cap (TranslationOptions.LoopIterationCap, DMSH_LOOP_CAP). Each loop gets a function-scope uint counter, declared here because OpVariable
+        // must be in the function's first block. The preheader sets it to 0, so it restarts every time the loop is entered (a nested loop: on every iteration of the outer one);
+        // the continue block (the back-edge block: loops here are do-while) counts one iteration and takes the back edge only while the count is below the cap, otherwise it leaves
+        // to the merge block like a false condition does. That keeps the structured control flow as it is: no new block, the count is in the continue construct and the extra
+        // exit is the existing branch to the merge block. A bound read from memory that holds garbage (Ocarina of Time's light lists: up to 2^31 iterations per pixel) costs at
+        // most the cap instead of hanging the GPU. Every loop is capped, the helper functions' compare-and-swap retry loops too
+        private static void DeclareLoopCounters(CodeGenContext context, AstBlock mainBlock)
+        {
+            if (context.LoopIterationCap == 0)
+            {
+                context.LoopCounters = null;
+                return;
+            }
+
+            Dictionary<AstBlock, SpvInstruction> counters = new();
+            Stack<AstBlock> pending = new();
+            pending.Push(mainBlock);
+
+            while (pending.Count != 0)
+            {
+                foreach (IAstNode node in pending.Pop())
+                {
+                    if (node is AstBlock child)
+                    {
+                        if (child.Type == AstBlockType.DoWhile)
+                        {
+                            SpvInstruction counter = context.Variable(context.TypePointer(StorageClass.Function, context.TypeU32()), StorageClass.Function);
+                            context.AddLocalVariable(counter);
+                            context.Name(counter, "dmsh_loop_n");
+                            counters.Add(child, counter);
+                        }
+
+                        pending.Push(child);
+                    }
+                }
+            }
+
+            context.LoopCounters = counters;
+        }
+
         private static void Generate(CodeGenContext context, AstBlock block)
         {
             AstBlockVisitor visitor = new(block);
@@ -359,6 +401,12 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                 }
                 else if (e.Block.Type == AstBlockType.DoWhile)
                 {
+                    // nxnative: the preheader restarts the loop's iteration count (DeclareLoopCounters)
+                    if (context.LoopCounters != null)
+                    {
+                        context.Store(context.LoopCounters[e.Block], context.Constant(context.TypeU32(), 0u));
+                    }
+
                     SpvInstruction continueTarget = context.Label();
 
                     loopTargets.Add(e.Block, (context.NewBlock(), continueTarget));
@@ -386,6 +434,17 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
                         context.AddLabel(continueTarget);
 
                         SpvInstruction condition = context.Get(AggregateType.Bool, e.Block.Condition);
+
+                        // nxnative: count the iteration and go back only while under the cap (DeclareLoopCounters)
+                        if (context.LoopCounters != null)
+                        {
+                            SpvInstruction counter = context.LoopCounters[e.Block];
+                            SpvInstruction u32 = context.TypeU32();
+                            SpvInstruction count = context.IAdd(u32, context.Load(u32, counter), context.Constant(u32, 1u));
+                            context.Store(counter, count);
+                            SpvInstruction underCap = context.ULessThan(context.TypeBool(), count, context.Constant(u32, context.LoopIterationCap));
+                            condition = context.LogicalAnd(context.TypeBool(), condition, underCap);
+                        }
 
                         context.BranchConditional(condition, loopTarget, context.GetNextLabel(mergeBlock));
                     }

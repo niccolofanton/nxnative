@@ -2,7 +2,7 @@
 """Control flow through the offline translator (dmsh_xlate, arch sm86): forward jumps must not come out as loops, and a jump table must stop where the next one starts.
 A loop the program does not have costs Metal's compilers dearly: Splatoon Raiders' uber shaders, with neither fix, took hours in the front end and crashed the GPU compiler.
 Needs DMSH_TEST_XLATE (the translator) like the other translator tests."""
-import json, os, re, struct, subprocess, sys, tempfile, unittest
+import json, os, re, shutil, struct, subprocess, sys, tempfile, unittest
 from pathlib import Path
 
 TOOLS = Path(__file__).resolve().parents[1] / 'tools'
@@ -38,14 +38,17 @@ def assemble(insts):
 
 @unittest.skipUnless(os.environ.get('DMSH_TEST_XLATE'), 'set DMSH_TEST_XLATE to the offline translator')
 class ControlFlow(unittest.TestCase):
-    def translate(self, insts, c1=b''):
+    def translate(self, insts, c1=b'', **extra):
         with tempfile.TemporaryDirectory(prefix='control_flow_') as d:
             work = Path(d); (work / 'k.bin').write_bytes(assemble(insts))
-            job = [dict(key='k', stage='cs', arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, local=[32, 1, 1], debug=True, nvn2_cs=[0, 0, 3, 0x40, 0], c1=c1.hex())]
+            job = [dict(key='k', stage='cs', arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, local=[32, 1, 1], debug=True, nvn2_cs=[0, 0, 3, 0x40, 0], c1=c1.hex(), **extra)]
             (work / 'jobs.json').write_text(json.dumps(job))
             r = subprocess.run([os.environ['DMSH_TEST_XLATE'], str(work / 'jobs.json'), d], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertTrue((work / 'k.spv').exists(), r.stdout + r.stderr)
+            if shutil.which('spirv-val'):   # the structured control flow rules (a loop's continue construct and merge block), which SPIRV-Cross does not check
+                r = subprocess.run(['spirv-val', '--target-env', 'vulkan1.1', str(work / 'k.spv')], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             sys.path.insert(0, str(TOOLS)); import dmsh_geometry
             dmsh_geometry.flatten_sets(work / 'k.spv')
             r = subprocess.run([str(TOOLS / 'spirv_cross_bin/spirv-cross'), '--msl', '--msl-version', '20300', '--msl-argument-buffers', str(work / 'k.spv')], capture_output=True, text=True)
@@ -109,6 +112,42 @@ class ControlFlow(unittest.TestCase):
         msl = self.translate(*self.two_switches(second_extra=(0, 0, 0)))
         self.assert_no_loop(msl)
         self.assertEqual(len(re.findall(r'== (?:\w+\()?\d+', msl)), 2, msl)
+
+
+@unittest.skipUnless(os.environ.get('DMSH_TEST_XLATE'), 'set DMSH_TEST_XLATE to the offline translator')
+class LoopCap(unittest.TestCase):
+    """Every loop runs its body at most loop_cap times per entry (job loop_cap, DMSH_LOOP_CAP, default 65536; SpirvGenerator.DeclareLoopCounters). Ocarina of Time's light-list loops in
+    Kokiri read their bound from a storage buffer; garbage there meant up to 2^31 iterations per pixel and a GPU hang (kIOGPUCommandBufferCallbackErrorHang)"""
+    LOOP = [WORK, bra(1, 0, pred=0), EXIT]   # do { work } while (P0)
+    NESTED = [WORK, WORK, bra(2, 1, pred=0), bra(3, 0, pred=1), EXIT]   # do { work; do { work } while (P0) } while (P1)
+
+    translate = ControlFlow.translate
+
+    def body(self, msl):
+        return msl[msl.index('kernel void main0'):]
+
+    def test_a_loop_is_capped_by_default(self):
+        msl = self.body(self.translate(self.LOOP))
+        self.assertRegex(msl, r'dmsh_loop_n = 0u;')   # in the preheader
+        self.assertRegex(msl, r'(\w+) = (?:dmsh_loop_n|_\d+) \+ 1u;\s*dmsh_loop_n = \1;')   # counted in the continue block
+        self.assertRegex(msl, r'< 65536u')
+        self.assertLess(msl.index('dmsh_loop_n = 0u'), re.search(r'\bdo\b|\bfor\b|\bwhile\b', msl).start())   # reset before the loop, not once per invocation in it
+
+    def test_the_cap_is_the_jobs(self):
+        self.assertRegex(self.body(self.translate(self.LOOP, loop_cap=5)), r'< 5u')
+
+    def test_zero_turns_it_off(self):
+        msl = self.body(self.translate(self.LOOP, loop_cap=0))
+        self.assertNotIn('dmsh_loop_n', msl)
+        self.assertRegex(msl, r'\bwhile\b|\bfor\b')
+
+    def test_nested_loops_have_one_counter_each(self):
+        msl = self.body(self.translate(self.NESTED))
+        names = set(re.findall(r'\b(dmsh_loop_n\w*) = 0u;', msl))
+        self.assertEqual(len(names), 2, msl)
+        outer = min(names, key=msl.index)   # the outer loop's reset comes first, the inner one's inside the outer loop's body, after its do
+        inner = (names - {outer}).pop()
+        self.assertLess(re.search(r'\bdo\b|\bfor\b|\bwhile\b', msl).start(), msl.index(inner + ' = 0u'))
 
 
 if __name__ == '__main__':

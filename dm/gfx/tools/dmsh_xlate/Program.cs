@@ -203,7 +203,9 @@ static class SwshXlate
                 // Job debug = false: turn off DebugMode (DebugMode skips the AST optimizer and the output is full of temporaries; semantics unchanged)
                 // Job f32_atomic = "cas" (DMSH_F32_ATOMIC in dmsh_build.py): a float atomic add stays a compare-and-swap loop; otherwise it is a native atomic_float add (InstEmitMemory.EmitAtomicAddF32)
                 var flags = ((string)job["f32_atomic"] == "cas" ? 0 : TranslationFlags.MetalFloatAtomics) | TranslationFlags.MetalImageAtomics | (job["debug"] is JsonNode dbg && !(bool)dbg ? 0 : TranslationFlags.DebugMode) | ((string)job["stage"] == "cs" ? TranslationFlags.Compute : 0) | ((string)job["arch"] == "sm86" ? TranslationFlags.Ampere : 0);
-                var ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
+                // Job loop_cap (DMSH_LOOP_CAP in dmsh_chain.py, default 65536, 0 = no limit): the most times one entry into a loop runs its body (SpirvGenerator.DeclareLoopCounters)
+                var options = new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags, job["loop_cap"] is JsonNode lc ? (uint)lc : 1u << 16);
+                var ctx = Translator.CreateContext(0, acc, options);
                 bool geometry = job["geometry_topology"] != null;
                 ShaderProgram p = ctx.Translate(geometry);
                 Dictionary<int, SamplerType> imageTypes = null, textureTypes = null;
@@ -212,19 +214,19 @@ static class SwshXlate
                 if (imageTypes != null || textureTypes != null)
                 {
                     acc = new Accessor(code, job, imageTypes, textureTypes);
-                    ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
+                    ctx = Translator.CreateContext(0, acc, options);
                     p = ctx.Translate(geometry);
                 }
                 if (UsesFloat64(p.BinaryCode))   // Tears of the Kingdom 1.4.3: 30 shaders used double and failed in the Metal compiler
                 {
                     job["softfloat64"] = true; acc = new Accessor(code, job, imageTypes, textureTypes);
-                    ctx = Translator.CreateContext(0, acc, new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
+                    ctx = Translator.CreateContext(0, acc, options);
                     p = ctx.Translate(geometry); acc.Notes.Add("FP64 lowered to FP32 (DoubleToFloat)");
                 }
                 if (geometry)
                 {
                     // A fresh context: translation mutates the decoded program.
-                    var reader = Translator.CreateContext(0, new Accessor(code, job, imageTypes, textureTypes), new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags));
+                    var reader = Translator.CreateContext(0, new Accessor(code, job, imageTypes, textureTypes), options);
                     File.WriteAllBytes(Path.Combine(outDir, key + ".reader.spv"), reader.GenerateVertexPassthroughForCompute().BinaryCode);
                 }
                 File.WriteAllBytes(Path.Combine(outDir, key + ".spv"), VertexCounterLowering.Apply(code, (string)job["stage"], p.BinaryCode, acc.Notes));
