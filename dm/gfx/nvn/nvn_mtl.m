@@ -13939,19 +13939,27 @@ void dm_gfx_shot_at(long k, const char *path) {
 }
 // DM_NVN_SHOT_OUT=WIDTHxHEIGHT (for picture quality metrics): the present-frame screenshot instead captures the result "upscaled to this resolution by the present pass", i.e. the picture the player sees on a screen
 // of that size (with DM_PRESENT_UPSCALE=metalfx through MetalFX, on the Metal 4 queue: present_offscreen_m4); screen=0 (texture dump) is unaffected
+// Without DM_NVN_SHOT_OUT, a screen shot of a cropped present (Zelda OoT: 2048x1152 in a 2560x1440 swapchain) is taken through the same present pass at the crop's width in the display shape, i.e. the picture the window shows, not the raw texture with its black border;
+// DM_NVN_SHOT_RAW=1 restores the raw swapchain texture
+static void present_shape(id<MTLTexture> src, double *w, double *h);
+static int present_crop_rect(id<MTLTexture> src, const int crop[4], NSUInteger r[4]);
 static void shot(id<MTLTexture> src, const char *path, int screen, const int crop[4]) {
-    static int out_w = -1, out_h;
+    static int out_w = -1, out_h, raw = -1;
+    if (raw < 0) raw = getenv("DM_NVN_SHOT_RAW") && atoi(getenv("DM_NVN_SHOT_RAW"));
     if (out_w < 0) {
         out_w = 0;
         const char *e = getenv("DM_NVN_SHOT_OUT"); int w = 0, h = 0; char sep = 0, extra = 0;
         if (e && sscanf(e, "%d%c%d%c", &w, &sep, &h, &extra) == 3 && sep == 'x' && w > 0 && h > 0) { out_w = w; out_h = h; }
     }
     id<MTLTexture> read = src;
-    if (out_w && screen) {
-        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:out_w height:out_h mipmapped:NO];
+    int sw = out_w, sh = out_h; NSUInteger cr[4];
+    if (!sw && screen && !raw && present_crop_rect(src, crop, cr) && (cr[2] != src.width || cr[3] != src.height)) {
+        double pw, ph; present_shape(src, &pw, &ph); sw = (int)cr[2]; sh = (int)lround(cr[2] * ph / pw); }
+    if (sw && screen) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:sw height:sh mipmapped:NO];
         d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
         id<MTLTexture> out = [g_dev newTextureWithDescriptor:d];
-        if (!out) { MLOG("[RED] cannot create the screenshot output texture %dx%d", out_w, out_h); return; }
+        if (!out) { MLOG("[RED] cannot create the screenshot output texture %dx%d", sw, sh); return; }
         if (g_q4) { if (!present_offscreen_wait(src, crop, out)) return; }
         else { id<MTLCommandBuffer> cb = q_cb(); if (!present_encode(cb, src, out, crop)) return; [cb commit]; [cb waitUntilCompleted]; }
         read = out;
