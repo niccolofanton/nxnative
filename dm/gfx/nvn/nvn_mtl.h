@@ -23,6 +23,7 @@ void mtl_sp_phys_gone(const void *mem, uint64_t size);
 void mtl_pool_gpu_written(const void *pool);   // the GPU writes this pool (with DM_NVN_GPUW_RANGE=0, its uncompressed textures are no longer taken from storage)
 void mtl_tex_gpu_written(const void *tex);   // the GPU writes this texture (a tex_t): its pool, and with DM_NVN_GPUW_RANGE (default) its storage range; uncompressed textures over GPU-written storage are no longer taken from it (tex_cpu_content)
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off);   // 1 on success; buf is a (__bridge) id<MTLBuffer>
+int mtl_pool_holds(uint64_t addr, uint64_t len);   // 1 when the range lies in one memory pool (as mtl_addr finds it); does not make the pool resident
 
 typedef struct {
     uint32_t pso, cps, shaders, dss;
