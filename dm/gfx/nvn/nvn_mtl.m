@@ -13533,6 +13533,34 @@ static void clear_ds_tri(const p_clear_ds *c) {
        (unsigned long)sc.x, (unsigned long)sc.y, (unsigned long)sc.width, (unsigned long)sc.height);
 }
 
+// DM_NVN_PROBE_EVERY=<k>[:<size>] (off by default; read again every 1,024 draws, so DM_CTL env can change it mid-run): a reflection-probe face -- targets whose colour 0 is one
+// <size>x<size> (default 128) level of an RG11B10Float 2D array or cube texture, with depth attached -- is drawn only on every k-th visit to that (texture, level, layer), so each
+// face still updates every k visits. On the other visits the clears and draws from that OP_SET_RT to the next are dropped: no pass opens and no clear is left waiting, so colour and
+// depth keep their previous content. Ocarina of Time renders one face of its 128x128 probe a frame, about 200 mostly mesh draws, 3-5 ms on an M1 Pro. The mip-filter passes after
+// it still run, on unchanged input (about 0.4 ms). Not with pass merging that plans across targets (deferred groups, readable-tile merges, slice merges, TBDR)
+static int g_probe_skip;   // the current targets' clears and draws are dropped (probe_visit)
+static int probe_visit(const p_set_rt *r) {
+    static int k = -1, size = 128, logged; static uint64_t at; static struct { uint64_t ser; int lv, sl; uint32_t n; } tab[32]; static int ntab;
+    if (k < 0 || g_stat_draw - at >= 1024) { at = g_stat_draw; const char *e = getenv("DM_NVN_PROBE_EVERY"), *c = e ? strchr(e, ':') : NULL;
+        k = e ? atoi(e) : 0; size = c && atoi(c + 1) > 0 ? atoi(c + 1) : 128; }
+    static uint64_t last_ser; static int last_lv, last_sl, last_skip;   // the targets set just before: the same probe layer set again is the same visit (one count, one decision)
+    uint64_t ser = 0; int lv = 0, sl = 0; const tex_t *t = r->n >= 1 ? r->color[0] : NULL;
+    if (k <= 1 || !t || !r->depth || defer_has_active() || g_defer_replaying || g_fz.active || g_sm_pass || tbdr_on()) { last_ser = 0; return 0; }
+    rt_sub(r, 0, &ser, &lv, &sl);
+    if ((int)MAX(t->d.width >> lv, 1u) != size || (int)MAX(t->d.height >> lv, 1u) != size) { last_ser = 0; return 0; }
+    id<MTLTexture> mt = tex_mtl(t); MTLTextureType tt = mt ? mt.textureType : MTLTextureType2D;
+    if (!mt || mt.pixelFormat != MTLPixelFormatRG11B10Float || (tt != MTLTextureType2DArray && tt != MTLTextureTypeCube && tt != MTLTextureTypeCubeArray)) { last_ser = 0; return 0; }
+    if (ser == last_ser && lv == last_lv && sl == last_sl) return last_skip;
+    int i = 0; while (i < ntab && (tab[i].ser != ser || tab[i].lv != lv || tab[i].sl != sl)) i++;
+    if (i == ntab) { if (ntab < 32) ntab++; else i = (int)((ser * 7 + (uint64_t)sl) & 31); tab[i].ser = ser; tab[i].lv = lv; tab[i].sl = sl; tab[i].n = 0; }
+    int skip = tab[i].n++ % (uint32_t)k != 0;
+    if (logged != k) { logged = k; MLOG("DM_NVN_PROBE_EVERY=%d: probe targets engaged, first ser=%llu %dx%d RG11B10Float layer %d level %d with depth; drawn on every %d-th visit per layer, the other visits keep the previous content",
+                                        k, (unsigned long long)ser, size, size, sl, lv, k); }
+    PD("M %llu probe target ser=%llu layer %d visit %u: %s", g_stat_pass, (unsigned long long)ser, sl, tab[i].n, skip ? "clears and draws dropped (DM_NVN_PROBE_EVERY)" : "drawn");
+    last_ser = ser; last_lv = lv; last_sl = sl; last_skip = skip;
+    return skip;
+}
+
 void mtl_exec(const uint8_t *p) {
     if (!g_state_inited) state_reset();
     static int dump_all = -1; if (dump_all < 0) dump_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;
@@ -13597,6 +13625,7 @@ void mtl_exec(const uint8_t *p) {
                    n >= 4 ? ((const float *)((const uint8_t *)a + 16))[0] : 0.f, n >= 8 ? ((const float *)((const uint8_t *)a + 16))[1] : 0.f, n >= 12 ? ((const float *)((const uint8_t *)a + 16))[2] : 0.f, n >= 16 ? ((const float *)((const uint8_t *)a + 16))[3] : 0.f); mtl_sub_update((const uint8_t *)a + 16, d, n); break; }
             case OP_SET_RT: {
                 const p_set_rt *r = a;
+                g_probe_skip = probe_visit(r);   // DM_NVN_PROBE_EVERY: this probe face's clears and draws are dropped until the next targets
                 if (defer_begin_q(p)) break;
                 int pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i];
                 if (g_enc && !pend && R.has_rt && tbdr_on() && rt_range_same(&R.rt,r)) {
@@ -13614,6 +13643,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_CLEAR_COLOR: {
                 const p_clear_color *c = a;
                 if (g_rc_skip) { PD("c %llu color clear skipped by conditional rendering slot%d", g_stat_pass, c->index); break; }
+                if (g_probe_skip && R.has_rt) break;
                 // A scissored clear to 0 outside a pass with all channels (SMBW clears pyramid levels as sub-rectangles of 480×272 and other targets): copy from the zero buffer into the scissor rectangle in the replay stream
                 if (!g_enc && c->mask == 0xf && !c->rgba[0] && !c->rgba[1] && !c->rgba[2] && !c->rgba[3] && R.has_sc && c->index >= 0 && c->index < R.rt.n && R.rt.color[c->index]
                     && !scissor_full(R.rt.color[c->index], &R.rt.cview[c->index], R.rt.has_cview[c->index]) && clear_rect_zero(c->index)) break;
@@ -13631,6 +13661,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_CLEAR_DS: {
                 const p_clear_ds *c = a;
                 if (g_rc_skip) { PD("c %llu depth-stencil clear skipped by conditional rendering", g_stat_pass); break; }
+                if (g_probe_skip && R.has_rt) break;
                 if (g_rt_merged || g_sm_pass) rp_end();
                 // A load-action clear covers the whole attachment and every stencil bit. A clear whose scissor does not cover the depth target, or whose stencil mask is partial, is drawn as a triangle
                 // (clear_ds_tri), in or before a pass: before the first draw and for a partial stencil mask in a pass it used to clear the whole target (PR #108)
@@ -13655,11 +13686,11 @@ void mtl_exec(const uint8_t *p) {
             case OP_MULTI_DRAW:
                 // A lookahead from outside the range stops at its boundary, including scans for inline writes to the arguments.
                 g_mdx_epoch++; g_mdx_stop = NULL;
-                if (!g_rc_skip) draw_multi(a);
+                if (!g_rc_skip && !(g_probe_skip && R.has_rt)) draw_multi(a);
                 g_mdx_epoch++;
                 break;
-            case OP_DRAW: { if (g_rc_skip) break; p_draw t; g_exec_cur = p; g_exec_next = p + h.size; draw(draw_rec(a, h.size, &t), NULL); g_exec_next = NULL; break; }   // Lookahead start point
-            case OP_DRAW_IDX: { if (g_rc_skip) break; p_draw_idx t; g_exec_cur = p; g_exec_next = p + h.size; draw(NULL, draw_idx_rec(a, h.size, &t)); g_exec_next = NULL; break; }
+            case OP_DRAW: { if (g_rc_skip || (g_probe_skip && R.has_rt)) break; p_draw t; g_exec_cur = p; g_exec_next = p + h.size; draw(draw_rec(a, h.size, &t), NULL); g_exec_next = NULL; break; }   // Lookahead start point
+            case OP_DRAW_IDX: { if (g_rc_skip || (g_probe_skip && R.has_rt)) break; p_draw_idx t; g_exec_cur = p; g_exec_next = p + h.size; draw(NULL, draw_idx_rec(a, h.size, &t)); g_exec_next = NULL; break; }
             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
             case OP_BIND_PROGRAM: { const p_bind_program *b = a; state_op(h.op,a);
                 if (passdump()) { NvProg *pr = S.prog ? prog_get(S.prog) : nil;
@@ -13684,7 +13715,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_COPY_B2T: copy_b2t(a, h.size); break;
             case OP_COPY_T2B: copy_t2b(a, h.size); break;
             case OP_COPY_T2T: copy_t2t(a); break;
-            case OP_DRAW_TEX: draw_tex(a); break;
+            case OP_DRAW_TEX: if (!(g_probe_skip && R.has_rt)) draw_tex(a); break;
             case OP_CLEAR_TEX: clear_tex(a); break;
             case OP_DLSS: dlss_eval(a); break;
             case OP_DISPATCH: if (g_csh_n && csh_take(p)) { PD("H %llu dispatch already run ahead of the pass", g_stat_pass); break; }
