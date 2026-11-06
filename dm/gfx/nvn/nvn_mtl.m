@@ -13981,9 +13981,8 @@ void dm_gfx_shot_at(long k, const char *path) {
 }
 // DM_NVN_SHOT_OUT=WIDTHxHEIGHT (for picture quality metrics): the present-frame screenshot instead captures the result "upscaled to this resolution by the present pass", i.e. the picture the player sees on a screen
 // of that size (with DM_PRESENT_UPSCALE=metalfx through MetalFX, on the Metal 4 queue: present_offscreen_m4); screen=0 (texture dump) is unaffected
-// Without DM_NVN_SHOT_OUT, a screen shot of a cropped present (Zelda OoT: 2048x1152 in a 2560x1440 swapchain) is taken through the same present pass at the crop's width in the display shape, i.e. the picture the window shows, not the raw texture with its black border;
+// Without DM_NVN_SHOT_OUT, a screen shot of a cropped present (2048x1152 in a 2560x1440 swapchain) is taken through the same present pass at the crop's width in the display shape, i.e. the picture the window shows, not the raw texture with its black border;
 // DM_NVN_SHOT_RAW=1 restores the raw swapchain texture
-static void present_shape(id<MTLTexture> src, double *w, double *h);
 static int present_crop_rect(id<MTLTexture> src, const int crop[4], NSUInteger r[4]);
 static void shot(id<MTLTexture> src, const char *path, int screen, const int crop[4]) {
     static int out_w = -1, out_h, raw = -1;
@@ -13996,7 +13995,7 @@ static void shot(id<MTLTexture> src, const char *path, int screen, const int cro
     id<MTLTexture> read = src;
     int sw = out_w, sh = out_h; NSUInteger cr[4];
     if (!sw && screen && !raw && present_crop_rect(src, crop, cr) && (cr[2] != src.width || cr[3] != src.height)) {
-        double pw, ph; present_shape(src, &pw, &ph); sw = (int)cr[2]; sh = (int)lround(cr[2] * ph / pw); }
+        sw = (int)cr[2]; sh = (int)cr[3]; }   // this base's present stretches the crop to the layer: the crop's own shape
     if (sw && screen) {
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:sw height:sh mipmapped:NO];
         d.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; d.storageMode = MTLStorageModePrivate;
