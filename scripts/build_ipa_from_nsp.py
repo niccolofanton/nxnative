@@ -1006,7 +1006,7 @@ def write_profile(pdir, app, f):
 
 
 # ---- Derived profile (a version the game's profile was not brought up on) ----
-DERIVED_SKIP = {'game.tsv', 'shader_map.tsv', 'shader_facts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv', 'c1_full.tsv', 'cb_extent.tsv', 'vk_capture.tsv', 'gl_capture.tsv', 'patches.py'}   # made again from the packed version's own files (patches.py: the rewriter's patches of the registered builds)
+DERIVED_SKIP = {'game.tsv', 'shader_map.tsv', 'shader_facts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv', 'mesh_pairs.tsv', 'c1_full.tsv', 'cb_extent.tsv', 'vk_capture.tsv', 'gl_capture.tsv', 'patches.py'}   # made again from the packed version's own files (patches.py: the rewriter's patches of the registered builds)
 
 
 def derived_key(profile_dir):
@@ -1145,7 +1145,7 @@ def chain_files(repo):   # what the iOS shaders run: not the split's readers (sh
 
 def split_profile_inputs(g):   # shader_split.py's GAME reads, plus the tables the packer checks or writes; renderer settings, notes and translation tables are not extraction inputs
     settings = [(name, g.get(name, '')) for name in ('modules', 'shader_groups', 'shader_note', 'shader_key_skip')]
-    tables = [g.table(n) for n in ('shader_facts_manual.tsv', 'shader_map.tsv', 'shader_facts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv')]
+    tables = [g.table(n) for n in ('shader_facts_manual.tsv', 'shader_map.tsv', 'shader_facts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv', 'mesh_pairs.tsv')]
     return [g.id, settings, ('files', tables)]
 
 
@@ -2214,6 +2214,11 @@ def split_shaders(py, repo, roms, mains, pkg, env, logs, g, provisional=False, o
         promote(derive_compute, 'compute')
     if provisional or g.table('pso_pairs.tsv').is_file(): names += ('pso_pairs.tsv',)
     else: shutil.copyfile(tmp / 'tables' / 'pso_pairs.tsv', pkg.with_name('pso_pairs.tsv'))
+    # mesh_pairs.tsv (NVN2 mesh / pixel pairs, dmsh_build.py mesh_reads): checked where the profile has one, taken by a provisional profile when it has rows; else its mesh shaders keep every output
+    split_mesh = tmp / 'tables' / 'mesh_pairs.tsv'
+    if g.table('mesh_pairs.tsv').is_file() or provisional and split_mesh.is_file() and any(l.strip() and not l.startswith(b'#') for l in split_mesh.read_bytes().splitlines()): names += ('mesh_pairs.tsv',)
+    elif split_mesh.is_file() and any(l.strip() and not l.startswith(b'#') for l in split_mesh.read_bytes().splitlines()):
+        say(f'the split found mesh / pixel shader pairs, but profile {g.id} has no mesh_pairs.tsv: its mesh shaders keep every output (copy {split_mesh} into the profile to trim them)')
     if provisional:   # a provisional profile takes the tables as they come
         for n in names: shutil.copyfile(tmp / 'tables' / n, g.table(n))
     else:

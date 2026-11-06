@@ -10,7 +10,7 @@
 #       dmsh_chain.py --header        rewrite dm/gfx/nvn/dmsh_chain.h (run after changing any file listed above, and commit it with the change)
 #       dmsh_chain.py --inputs        print the digest of the current game profile's inputs (DM_GAME), as b-<V>/inputs.tsv records it
 #       (checking the tools against dmsh_chain.lock, and rewriting it, is tool_lock.py's: the checks decide no output, so they are outside V and the shaders' cache keys)
-# Environment: XLATE_DEBUG / XLATE_REDUCED / DMSH_F32_ATOMIC (same meaning as in dmsh_build.py, default 1 / 1 / native; non-default options yield a different V, which the host will not load)
+# Environment: XLATE_DEBUG / XLATE_REDUCED / DMSH_F32_ATOMIC / DMSH_MESH_TRIM (same meaning as in dmsh_build.py, default 1 / 1 / native / 1; non-default options yield a different V, which the host will not load)
 import os, sys, ast, hashlib
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # Workspace root (game files, build outputs and run artifacts are all under it)
 HERE = os.path.dirname(os.path.abspath(__file__)); GFX = os.path.dirname(HERE); HOME = os.path.expanduser('~')
@@ -24,6 +24,7 @@ FILES += ['../third_party/ryujinx/src/Ryujinx.Graphics.Shader/' + f for f in (
     'StructuredIr/ShaderProperties.cs', 'Translation/Optimizations/BindlessElimination.cs', 'Translation/Optimizations/Optimizer.cs',
     'Translation/Optimizations/GlobalToStorage.cs', 'CodeGen/Spirv/SpirvGenerator.cs', 'Instructions/InstEmitMemory.cs')]
 INPUT_TABLES = ['shader_facts.tsv', 'shader_map.tsv', 'shader_map.tsv.conflicts.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv', 'bf_want.tsv', 'geo_mesh.tsv', 'dual_want.tsv']   # in the game profile folder
+OPTIONAL_TABLES = ['mesh_pairs.tsv']   # also inputs, but in the digest only where the profile has one: profiles without NVN2 mesh shaders keep their digest
 LOCK = os.path.join(HERE, 'dmsh_chain.lock'); HEADER = os.path.join(GFX, 'nvn/dmsh_chain.h')
 STAMP = 'inputs.tsv'   # in the library directory b-<V>/
 # the translator defaults to the in-repo build that matches the lock file (a rebuilt dll has different fingerprints)
@@ -38,8 +39,15 @@ def f32_atomic():
     if v not in ('native', 'cas'): sys.exit(f'[RED] DMSH_F32_ATOMIC={v}: expected native or cas')
     return v
 
+def mesh_trim():
+    """Whether a mesh shader hands Metal only the outputs its paired pixel shaders read (mesh_pairs.tsv; dmsh_meshstage.py widths): on by default, DMSH_MESH_TRIM=0 keeps every output a float4
+    as before. Part of the options, so each choice has its own V and shader cache keys"""
+    v = os.environ.get('DMSH_MESH_TRIM', '1')
+    if v not in ('0', '1'): sys.exit(f'[RED] DMSH_MESH_TRIM={v}: expected 0 or 1')
+    return v == '1'
+
 def options():
-    return 'debug=%s reduced=%s f32_atomic=%s' % (os.environ.get('XLATE_DEBUG', '1') != '0', os.environ.get('XLATE_REDUCED', '1') == '1', f32_atomic())
+    return 'debug=%s reduced=%s f32_atomic=%s mesh_trim=%s' % (os.environ.get('XLATE_DEBUG', '1') != '0', os.environ.get('XLATE_REDUCED', '1') == '1', f32_atomic(), mesh_trim())
 
 def version():
     h = hashlib.sha256()
@@ -73,6 +81,9 @@ def inputs(g):
     for f in INPUT_TABLES:
         p = g.table(f)
         h.update(f'game/{f}'.encode() + b'\0' + (p.read_bytes() if p.exists() else b'missing') + b'\0')
+    for f in OPTIONAL_TABLES:
+        p = g.table(f)
+        if p.exists(): h.update(f'game/{f}'.encode() + b'\0' + p.read_bytes() + b'\0')
     h.update(profile_rows(g))
     return h.hexdigest()[:12]
 

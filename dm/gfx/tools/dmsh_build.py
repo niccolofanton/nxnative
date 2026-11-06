@@ -1199,11 +1199,13 @@ def int_inputs(src):
         if not bad and nint: out[str(loc_)] = 'uint'
     return out
 
-# Both pair tables feed pipelines, so both must feed padding, build order and shader cache keys.
+# Both pair tables feed pipelines, so both must feed padding, build order and shader cache keys. mesh_pairs.tsv (mesh key, pixel key; profiles with NVN2 mesh shaders) feeds the same
+# build order and cache keys: a mesh shader's outputs are trimmed to what its pixel shaders' MSL reads (mesh_reads). The host never reads it, so no vertex pipeline is built from it
 def load_pairs(game, package):
     pairs = collections.defaultdict(set)
-    for table in ('shader_pairs.tsv', 'pso_pairs.tsv'):
+    for table in ('shader_pairs.tsv', 'pso_pairs.tsv', 'mesh_pairs.tsv'):
         path = str(game.table(table))
+        if table == 'mesh_pairs.tsv' and not os.path.isfile(path): continue
         if table == 'pso_pairs.tsv' and not os.path.isfile(path):
             path = os.path.join(os.path.dirname(os.path.abspath(package)), table)   # the split's copy for profiles predating this table
         if table == 'pso_pairs.tsv' and not os.path.isfile(path): continue
@@ -1233,6 +1235,19 @@ def vs_pad(key, src):
     src = src[:j] + ''.join(f'\n    float4 dm_pad{l} [[user(locn{l})]];' for l in miss) + src[j:]
     k = src.find('main0_out out = {};') + len('main0_out out = {};')
     return src[:k] + ''.join(f'\n    out.dm_pad{l} = float4(0.0, 0.0, 0.0, 1.0);' for l in miss) + src[k:], miss
+
+MESH_TRIM = collections.Counter()
+def mesh_reads(key):
+    """What a mesh shader's paired pixel shaders read (dmsh_meshstage.ps_reads, their union), for trimming its outputs; None keeps every output: DMSH_MESH_TRIM=0, no pairs (mesh_pairs.tsv), or a
+    paired pixel shader whose MSL is not there or cannot be read (a missing output a pixel shader reads would fail the pipeline, where an extra one only costs). Paired keys finish after the
+    others, so the pixel shaders of this build are written by then (as for vs_pad)"""
+    if not dmsh_chain.mesh_trim() or not PAIRS.get(key): return None
+    got = []
+    for ps in sorted(PAIRS[key]):
+        fn = os.path.join(out, ps + '_b.metal')
+        if not os.path.isfile(fn): return None
+        with open(fn) as f: got.append(dmsh_meshstage.ps_reads(f.read()))
+    return dmsh_meshstage.merge_reads(got)
 
 def vs_init(src):
     """Every vertex shader output starts as (0,0,0,1) before the translated body runs: on the hardware that is what an unwritten component reads. The translator's source starts with out = {}, all zeros;
@@ -1631,8 +1646,12 @@ def finish(key, w, j, c1):
     mesh = j.get('mesh_stage')
     if mesh:   # the kernel as the Metal object or mesh function (dmsh_meshstage.py)
         if mesh.get('refused'): return 'mesh stage failed', mesh['refused'], None
-        try: src = dmsh_meshstage.to_stage(src, mesh); open(msl, 'w').write(src)
+        reads = mesh_reads(key) if mesh['kind'] == 'ms' else None   # only the outputs its pixel shaders read (see mesh_reads)
+        try: src = dmsh_meshstage.to_stage(src, mesh, reads); open(msl, 'w').write(src)
         except ValueError as e: return 'mesh stage failed', str(e)[:160], None
+        if mesh['kind'] == 'ms':
+            MESH_TRIM['trimmed' if reads is not None else 'kept'] += 1
+            MESH_TRIM['before'] += dmsh_meshstage.vertex_bytes(mesh); MESH_TRIM['after'] += dmsh_meshstage.vertex_bytes(mesh, reads)
     elif j['stage'] == 'cs':
         src, first = first_store(src, j.get('local')); open(msl, 'w').write(src)   # the first invocation's store, for the host (see first_store)
         try: src, spill = tg_spill(src)   # shared memory past Metal's 32 KB in a device buffer (see tg_spill)
@@ -1879,6 +1898,10 @@ print(f'shadow-input libraries (<key>_bv, dmsh_vin.py): {VIN_STATS["generated"]}
 print(f'alpha test and logic operation libraries (<key>_bx, dmsh_side.py): {SIDE_STATS["generated"]} generated, {SIDE_STATS["failed"]} failed to compile, {SIDE_STATS["not generated"]} pixel shaders without either')
 print(f'pulling libraries (<key>_bp, dmsh_pull.py): {PULL_STATS["generated"]} generated, {PULL_STATS["failed"]} failed to compile, {PULL_STATS["not generated"]} not generated, '
       f'{PULL_STATS["no stage input"]} vertex shaders without stage inputs (none needed)')
+if MESH_TRIM['trimmed'] + MESH_TRIM['kept']:
+    _n = MESH_TRIM['trimmed'] + MESH_TRIM['kept']
+    print(f'mesh shader outputs (dmsh_meshstage.py widths, DMSH_MESH_TRIM): {MESH_TRIM["trimmed"]} of {_n} built this time trimmed to what their pixel shaders read, {MESH_TRIM["kept"]} kept whole '
+          f'(no pairs, a pixel shader without MSL, or trimming off); vertex {MESH_TRIM["before"] / _n:.1f} -> {MESH_TRIM["after"] / _n:.1f} bytes on average')
 print('mesh libraries (<vertex>_<geometry>_m3, dmsh_mesh.py): ' + (', '.join(f'{k} {v}' for k, v in MESH_STATS.items()) or 'none'))
 print(MTL.summary())
 for lvl in [k for k in st if k != 'ok']:

@@ -167,6 +167,124 @@ class Stage(unittest.TestCase):
                     self.assertEqual(r.returncode, 0, f'{sdk} case {n}: {r.stderr[-1500:]}')
 
 
+PIXEL = """struct main0_out
+{
+    float4 m_9 [[color(0)]];
+};
+
+struct main0_in
+{
+    float4 m_84 [[user(locn2)]];
+    float4 m_78 [[user(locn3)%s]];
+    float4 m_82 [[user(locn4)]];
+};
+
+fragment main0_out main0(main0_in in [[stage_in]], float4 gl_FragCoord [[position]])
+{
+    main0_out out = {};
+    float _26 = in.m_84.x;
+    float2 _27 = in.m_78.xy;
+    out.m_9 = float4(_26, _27, %s);
+    return out;
+}
+"""
+
+
+class Trim(unittest.TestCase):
+    """Mesh outputs cut to what the paired pixel shaders read (dmsh_meshstage.py ps_reads, widths; dmsh_build.py mesh_reads), on the shape of Ocarina of Time's grass mesh shader
+    3439aaa071d868ae: its SPH enables only what the program's pixel shader reads, so the saving is the zero / one fillers of its float4s (144 -> 112 bytes a vertex)"""
+    def test_reads_by_swizzle(self):
+        self.assertEqual(ms.ps_reads(PIXEL % ('', '1.0')), {2: {0}, 3: {0, 1}, 4: set()})
+
+    def test_whole_member_reads_all(self):   # no swizzle, an index or a flat qualifier
+        self.assertEqual(ms.ps_reads(PIXEL % (', flat', 'in.m_82[1]'))[4], {0, 1, 2, 3})
+        self.assertEqual(ms.ps_reads(PIXEL % ('', 'dot(in.m_82, in.m_82)'))[4], {0, 1, 2, 3})
+        self.assertEqual(ms.ps_reads(PIXEL % ('', 'in.m_82.w'))[4], {3})
+
+    def test_unknown_reads(self):   # the struct used whole, or an input that is not user(locnN), cannot be told: None keeps every output
+        self.assertIsNone(ms.ps_reads(PIXEL.replace('    float _26 = in.m_84.x;', '    main0_in c = in;\n    float _26 = c.m_84.x;') % ('', '1.0')))
+        self.assertIsNone(ms.ps_reads(PIXEL.replace('user(locn4)', 'user(locn4_1)') % ('', '1.0')))
+        self.assertEqual(ms.ps_reads('fragment float4 main0() { return float4(1.0); }'), {})
+
+    def test_merge(self):
+        a, b = ms.ps_reads(PIXEL % ('', '1.0')), {4: {2}, 9: {0}}
+        self.assertEqual(ms.merge_reads([a, b]), {2: {0}, 3: {0, 1}, 4: {2}, 9: {0}})
+        self.assertIsNone(ms.merge_reads([a, None])); self.assertIsNone(ms.merge_reads([]))
+
+    def info(self, primitive=False):   # position; generics 2 (xyz), 3 (xy), 4 (x), 5 (xyzw); per primitive 0 (x)
+        area = sph(0xf0, b'\x00\x37\xf1') + (sph(0, b'\x01') if primitive else b'')
+        return ms.info(control(7, payload=128, max_v=64, max_p=126, prim_at=0x80 if primitive else 0), area)
+
+    def stage(self, reads, primitive=False):
+        i = self.info(primitive)
+        return ms.to_stage(KERNEL % (ms.memory(i)[1] // 4, ms.memory(i)[0][3] // 4), i, reads)
+
+    def test_widths(self):
+        i = self.info()
+        self.assertEqual(ms.widths(i), ({2: 4, 3: 4, 4: 4, 5: 4}, {}))
+        reads = {2: {0, 1, 2}, 3: {0, 1}, 4: set(), 5: {3}}
+        self.assertEqual(ms.widths(i, reads)[0], {2: 3, 3: 2, 4: 1, 5: 4})
+        self.assertEqual((ms.vertex_bytes(i), ms.vertex_bytes(i, reads)), (80, 56))
+
+    def test_narrowed_outputs(self):
+        src = self.stage({2: {0, 1, 2}, 3: {1}, 5: {0, 1, 2, 3}})
+        self.assertIn('    float3 a2 [[user(locn2)]];\n    float2 a3 [[user(locn3)]];\n    float4 a5 [[user(locn5)]];\n};', src)
+        self.assertNotIn('locn4', src)   # no pixel shader declares it
+        self.assertRegex(src, r'v\.a2 = float3\(as_type<float>\(_23\[b \+ 128u\]\), as_type<float>\(_23\[b \+ 160u\]\), as_type<float>\(_23\[b \+ 192u\]\)\);')
+        self.assertIn('float4 position [[position]];', src)
+
+    def test_a_read_component_the_mesh_does_not_write_keeps_its_default(self):   # generic 4 has only x: a pixel shader reading its w still gets 1
+        src = self.stage({4: {3}})
+        self.assertIn('float4 a4 [[user(locn4)]];', src)
+        self.assertRegex(src, r'v\.a4 = float4\(as_type<float>\(_23\[b \+ \d+u\]\), 0\.0, 0\.0, 1\.0\);')
+
+    def test_single_component(self):
+        self.assertRegex(self.stage({4: {0}}), r'float a4 \[\[user\(locn4\)\]\];[\s\S]*v\.a4 = as_type<float>\(_23\[b \+ \d+u\]\);')
+
+    def test_unread_primitive_outputs_leave_no_primitive_struct(self):
+        self.assertIn('metal::mesh<dm_vertex_t, void,', self.stage({2: {0}}, primitive=True))
+        self.assertIn('    float p0 [[user(locn0)]];', self.stage({0: {0}, 2: {0}}, primitive=True))
+
+    def test_none_keeps_everything(self):
+        i = self.info()
+        self.assertEqual(self.stage(None), ms.to_stage(KERNEL % (ms.memory(i)[1] // 4, ms.memory(i)[0][3] // 4), i))
+        self.assertEqual(self.stage(None).count('float4 a'), 4)
+
+    @unittest.skipUnless(shutil.which('xcrun') and subprocess.run(['xcrun', '-sdk', 'macosx', '-f', 'metal'], capture_output=True).returncode == 0, 'no Metal compiler')
+    def test_compiles(self):
+        with tempfile.TemporaryDirectory() as d:
+            for n, src in enumerate([self.stage({2: {0, 1, 2}, 3: {1}, 4: {0}}), self.stage({0: {0}, 5: {3}}, primitive=True)]):
+                f = Path(d, f't{n}.metal'); f.write_text(src)
+                r = subprocess.run(['xcrun', '-sdk', 'macosx', 'metal', '-target', 'air64-apple-macos15.0', '-c', str(f), '-o', str(f.with_suffix('.air'))], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr[-1500:])
+
+
+class SplitPairs(unittest.TestCase):   # shader_split.py var_pairs: an NVN2 BNSH variation's mesh and pixel shaders are a mesh pair (mesh_pairs.tsv), not a vertex pair
+    def test_mesh_pairs_by_variation(self):
+        import os
+        from unittest import mock
+        os.environ.setdefault('DM_GAME', '0400486024DEC000')
+        import shader_split as split
+        found = [('a#BNSH@0x0#var0', st, st.encode(), b'') for st in ('ts', 'ms', 'ps')] + [('a#BNSH@0x0#var1', st, st.encode() + b'1', b'') for st in ('vs', 'ps')] + \
+                [('a#BNSH@0x0#var2', 'ms', b'ms2', b'')]   # a mesh shader with no pixel shader (a depth pass) pairs with nothing
+        with mock.patch.object(split, 'skey', lambda ctl, code: ctl.decode()):
+            self.assertEqual(split.var_pairs(found), {('ms', 'ps', 'mesh'), ('vs1', 'ps1')})
+
+
+class Option(unittest.TestCase):   # DMSH_MESH_TRIM=0 is another chain version, as DMSH_F32_ATOMIC=cas is
+    def test_option_changes_the_chain(self):
+        import os
+        import dmsh_chain
+        on = dmsh_chain.options()
+        os.environ['DMSH_MESH_TRIM'] = '0'
+        try:
+            self.assertNotEqual(on, dmsh_chain.options()); self.assertIn('mesh_trim=False', dmsh_chain.options())
+            os.environ['DMSH_MESH_TRIM'] = 'no'
+            with self.assertRaises(SystemExit): dmsh_chain.options()
+        finally: del os.environ['DMSH_MESH_TRIM']
+        self.assertIn('mesh_trim=True', on)
+
+
 class IntegerPassThrough(unittest.TestCase):
     """dmsh_build.py fs_uint: a pixel shader that passes a flat input through to an integer target needs the integer entry point: Mario Kart World's dcb0504c844f1ecc, whose R8Uint output
     comes from its mesh stage's per-primitive attribute. A smooth input is not integer data"""

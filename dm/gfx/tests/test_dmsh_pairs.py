@@ -16,15 +16,16 @@ import unittest
 TOOLS = Path(__file__).resolve().parents[1] / 'tools'
 sys.path.insert(0, str(TOOLS))
 import dmsh_chain
+import dmsh_meshstage
 import dmsh_pull
 import pso_offline
 
 
 def builder():
     # Use production functions without the CLI's translator/profile initialization.
-    names = {'load_pairs', 'vs_pad', 'vs_depth', 'shader_key', 'pair_keyed'}
+    names = {'load_pairs', 'vs_pad', 'vs_depth', 'shader_key', 'pair_keyed', 'mesh_reads'}
     tree = ast.parse((TOOLS / 'dmsh_build.py').read_text())
-    ns = dict(collections=collections, os=os, re=re, sys=sys, hashlib=hashlib)
+    ns = dict(collections=collections, os=os, re=re, sys=sys, hashlib=hashlib, dmsh_chain=dmsh_chain, dmsh_meshstage=dmsh_meshstage)
     exec(compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names],
                             type_ignores=[]), str(TOOLS / 'dmsh_build.py'), 'exec'), ns)
     return ns
@@ -117,6 +118,24 @@ class Pairing(unittest.TestCase):
         self.ns['DUAL_WANT'].add('f1')
         dual = key('f1', 'pkg.bin', b'pixel')
         self.assertNotEqual(self.ns['pair_keyed'](v1, [f1]), self.ns['pair_keyed'](v1, [dual]))
+
+    def test_mesh_pairs_trim_from_the_pixel_shaders(self):   # mesh_pairs.tsv: optional, joins the pairs (build order, cache keys), and its pixel shaders' reads trim the mesh outputs
+        before = dmsh_chain.inputs(self.g)
+        self.g.table('mesh_pairs.tsv').write_text('# mesh\nm\tf1\nm\tf6\n')
+        self.assertNotEqual(before, dmsh_chain.inputs(self.g))
+        self.g.table('mesh_pairs.tsv').unlink()
+        self.assertEqual(before, dmsh_chain.inputs(self.g))   # a profile without the table keeps its digest
+        self.g.table('mesh_pairs.tsv').write_text('# mesh\nm\tf1\nm\tf6\n')
+        self.ns['PAIRS'] = self.ns['load_pairs'](self.g, self.package)
+        self.assertEqual(self.ns['PAIRS']['m'], {'f1', 'f6'})
+        reads = {0: {0, 1, 2, 3}, 1: {0, 1, 2, 3}, 6: {0, 1, 2, 3}}
+        self.assertEqual(self.ns['mesh_reads']('m'), reads)
+        self.assertIsNone(self.ns['mesh_reads']('unpaired'))
+        os.environ['DMSH_MESH_TRIM'] = '0'
+        try: self.assertIsNone(self.ns['mesh_reads']('m'))
+        finally: del os.environ['DMSH_MESH_TRIM']
+        (self.root / 'f6_b.metal').unlink()   # a pixel shader without MSL: every output stays
+        self.assertIsNone(self.ns['mesh_reads']('m'))
 
     @unittest.skipUnless(shutil.which('xcrun'), 'needs the Metal compiler')
     def test_metal_archive_with_padded_regular_and_pulling_entries(self):

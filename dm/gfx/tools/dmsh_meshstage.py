@@ -90,9 +90,60 @@ def _name(param):
     return m[1]
 
 
-def _component(c, base):
-    """A vector of 4 from the attribute area's components: base[c] is the word's expression, or None for a component the shader does not write (0, 0, 0, 1 as a vertex output starts)."""
-    return 'float4(' + ', '.join(f'as_type<float>({base[k]})' if base[k] else ('1.0' if k == 3 else '0.0') for k in range(4)) + ')' if c else ''
+def _value(base, width=4):
+    """The first `width` components of an output from the attribute area: base[k] is the word's expression, or None for a component the shader does not write (0, 0, 0, 1 as a vertex output
+    starts). One component is a float, more a vector"""
+    v = [f'as_type<float>({base[k]})' if base[k] else ('1.0' if k == 3 else '0.0') for k in range(width)]
+    return v[0] if width == 1 else f'float{width}(' + ', '.join(v) + ')'
+
+
+def _type(width): return 'float' if width == 1 else f'float{width}'
+
+
+_IN_STRUCT = re.compile(r'struct main0_in\n\{\n(.*?)\n\};', re.S)
+_IN_MEMBER = re.compile(r'\s*\w+\s+(\w+)\s*\[\[user\(locn(\d+)\)(?:,\s*\w+)*\]\];')
+
+
+def ps_reads(msl):
+    """{location: the components 0..3 it reads} of a pixel shader's MSL (dmsh_build.py: a paired pixel shader's _b.metal), or None when that cannot be told: an input not named
+    user(locnN), or the input struct used whole. A member read without a swizzle (whole, or indexed) counts as all four components; a declared member never read as none, but the
+    location stays, since Metal links a pipeline only when each fragment input is a mesh output. Every entry point of the file (fs_uint's, fs_dual's) reads the same struct"""
+    m = _IN_STRUCT.search(msl)
+    if not m: return None if re.search(r'\bmain0_in\b', msl) else {}
+    out = {}
+    for line in m[1].splitlines():
+        mm = _IN_MEMBER.fullmatch(line)
+        if not mm: return None
+        comps = out.setdefault(int(mm[2]), set())
+        for u in re.finditer(r'\bin\.%s\b(\.[xyzwrgba]{1,4}\b)?' % mm[1], msl):
+            comps |= {'xyzw'.index(c) if c in 'xyzw' else 'rgba'.index(c) for c in u[1][1:]} if u[1] else {0, 1, 2, 3}
+    if re.search(r'\bin\b(?!\.|\s*\[\[stage_in\]\])', msl): return None   # the struct passed or copied whole
+    return out
+
+
+def merge_reads(reads):
+    """The union of several pixel shaders' ps_reads (a mesh shader's pairs), or None when one of them is None or there are none"""
+    if not reads or any(r is None for r in reads): return None
+    out = {}
+    for r in reads:
+        for loc, comps in r.items(): out.setdefault(loc, set()).update(comps)
+    return out
+
+
+def widths(i, reads=None):
+    """({attribute: components} of the vertex outputs, the same of the per-primitive ones) the mesh function hands to Metal. Without reads every attribute the SPH enables is a float4, as a
+    vertex shader's outputs are. With reads (merge_reads of the paired pixel shaders) an attribute none of them declares is left out, and one they read keeps the components up to the last one
+    read (the others are never interpolated; the SPH already enables only what the program's pixel shader reads, so most of the saving is the zero / one fillers of the float4s)"""
+    def of(comps):
+        names = list(dict.fromkeys(n for n, _ in comps if n is not None))
+        if reads is None: return {n: 4 for n in names}
+        return {n: max(reads[n]) + 1 if reads[n] else 1 for n in names if n in reads}
+    return of(i['vertex']), of(i['primitive'])
+
+
+def vertex_bytes(i, reads=None):
+    """Bytes of a mesh function's vertex: the position and the vertex outputs, a word each component"""
+    return 16 + 4 * sum(widths(i, reads)[0].values())
 
 
 def _members(comps):
@@ -100,9 +151,9 @@ def _members(comps):
     return {n: [comps.index((n, c)) if (n, c) in comps else None for c in range(4)] for n in dict.fromkeys(n for n, _ in comps)}
 
 
-def to_stage(msl, i):
+def to_stage(msl, i, reads=None):
     """The translated kernel as the object function main0 (kind 'ts'), or the mesh functions main0 and main0_z (kind 'ms': the two depth conventions, as dmsh_build.py vs_depth gives a
-    vertex shader, near = -w and near = 0)."""
+    vertex shader, near = -w and near = 0). reads: what the mesh shader's pixel shaders read (merge_reads), which trims its outputs (widths); None keeps them all."""
     kind = i['kind']
     m = _KERNEL.search(msl)
     if not m: raise ValueError(f'{kind}: no kernel main0 starting with its stage memory')
@@ -139,13 +190,15 @@ def to_stage(msl, i):
     if max_v > METAL_MAX_VERTICES or max_p > METAL_MAX_PRIMITIVES: raise ValueError(f'ms: {max_v} vertices and {max_p} primitives exceed a Metal mesh')
     stride = max(len(vertex) + len(primitive), 1) * BLOCK   # words of an attribute block
     word = lambda comps, n: [f'{mem}[b + {comps[k] * BLOCK}u]' if comps[k] is not None else None for k in range(4)]
-    vm, pm = _members(vertex), {n: [c + len(vertex) if c is not None else None for c in v] for n, v in _members(primitive).items()}
-    head += ('struct dm_vertex_t {\n    float4 position [[position]];\n' + ''.join(f'    float4 a{n} [[user(locn{n})]];\n' for n in vm if n is not None) + '};\n' +
-             ('struct dm_prim_t {\n' + ''.join(f'    float4 p{n} [[user(locn{n})]];\n' for n in pm) + '};\n' if pm else '') +
+    vw, pw = widths(i, reads)
+    vm = {n: c for n, c in _members(vertex).items() if n is None or n in vw}
+    pm = {n: [c + len(vertex) if c is not None else None for c in v] for n, v in _members(primitive).items() if n in pw}
+    head += ('struct dm_vertex_t {\n    float4 position [[position]];\n' + ''.join(f'    {_type(vw[n])} a{n} [[user(locn{n})]];\n' for n in vm if n is not None) + '};\n' +
+             ('struct dm_prim_t {\n' + ''.join(f'    {_type(pw[n])} p{n} [[user(locn{n})]];\n' for n in pm) + '};\n' if pm else '') +
              f'using dm_mesh_t = metal::mesh<dm_vertex_t, {"dm_prim_t" if pm else "void"}, {max_v}, {max_p}, metal::topology::triangle>;\n')
     block = lambda v: f'{out}u + ({v} / {BLOCK}u) * {stride}u + {v} % {BLOCK}u'
-    sets = ''.join(f'        v.{"position" if n is None else f"a{n}"} = {_component(True, word(c, n))};\n' for n, c in vm.items())
-    psets = ''.join(f'        p.p{n} = {_component(True, word(c, n))};\n' for n, c in pm.items())
+    sets = ''.join(f'        v.{"position" if n is None else f"a{n}"} = {_value(word(c, n), 4 if n is None else vw[n])};\n' for n, c in vm.items())
+    psets = ''.join(f'        p.p{n} = {_value(word(c, n), pw[n])};\n' for n, c in pm.items())
     if None not in vm: raise ValueError('ms: its SPH enables no position component')
 
     def entry(name, gl):
