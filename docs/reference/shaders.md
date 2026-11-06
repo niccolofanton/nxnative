@@ -1352,6 +1352,15 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Check:** `test_dmsh_ampere_mem.py` `Shared.test_ldsm_reads_between_subgroup_barriers`. In the game, pixels of 6231 that differ from both vertical neighbours while those agree: 6,700-14,000 a frame before, 71-86 after (the YUV source: 40-58). The GPU time is unchanged.
 - **Found on:** The Legend of Zelda: Ocarina of Time (`0400486024DEC000`, profile in #1299): the movie library's NDVE shaders, five of which (`ba079f68ae288dba`, `a8b4fb48fee0ccf8`, `e6be82d835fbe4d3`, `7f7ff0f36b54d90f`, `5a7d69b067a7f011`) have no BAR between their STS and LDSM.
 
+### A plain HMMA call in a chain's slot
+
+- **Symptom:** the game's upscaler draws dotted lines over the whole picture, in the same place in every frame: vertical, one every 64 pixels and 32 pixels wide, at Ocarina of Time's 1536x864 to 2048x1152. Every target at render resolution is clean, and `DM_NVN_BARRIER=full` and `DM_NVN_CUT=0` change nothing.
+- **Cause:** [HMMA chains](#hmma-chains-keep-their-matrices-in-the-simd-group) keep a chain's D in an accumulator slot (`acc[(flags >> 8) * 2]`) until the call that takes it as C. A call in no chain has no slot in its flags, so it worked in slot 0, and `TensorPass` hands out slot 0 first: a plain call while a chain waited there replaced that chain's D with its own, and the chain's end added its products to the wrong matrix. Which calls those are is fixed by the shader, so the error is too. The network `fa3033d05c0a41d6` runs a 48x24 input tile to a 64x32 output tile and the wrong matrices (calls 4 to 9, for one: flags 12, 269, 8, 9, 2, 259) reach columns 0 to 31 of it, which gives the lines' width and spacing. All 52 HMMA shaders of Ocarina of Time's NDSR packs have such a call, and none of its 19 NDVE movie networks, on which the chains were measured. A raw dump of this R11G11B10F output has no alpha: its fourth byte is the top of blue.
+- **Fix:** `HMMA_BODY` (`dmsh_build.py`): a call with neither `FlagCSlot` nor `FlagDSlot` works in two matrices of its own, `acc[16]` and `acc[17]`, past the 8 slots. No translator change. A chain change.
+- **Check:** `dm/gfx/tests/test_dmsh_hmma.py`, `test_chains_survive_plain_calls`: those six calls against a CPU reference, with `fa3033d05c0a41d6`'s shared memory layout, at four and six SIMD-groups: without the fix, 8,081 of the 32,768 outputs at four are wrong, the slot 0 chain's 8,192 being the only ones at risk. Offline, one dispatch of that shader with its own weights from the pack on a synthetic picture (M5 Pro): as built, columns 0 to 31 of each tile differ from a per-lane HMMA by 26 of 255 on average, 2 to 67 by column, and columns 33 to 63 not at all; fixed, the output equals the same shader with every flag off in all 7,077,888 channels and the per-lane one within 1 of 255, in the same 0.7 ms. Not yet seen in the game.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md): GitHub issue 1537, on an M5 Max.
+
+
 ### Driver-segment reads outside fragment shaders
 
 - **Symptom:** a vertex or compute shader reads zeros from NVN's driver segment `c0`.
