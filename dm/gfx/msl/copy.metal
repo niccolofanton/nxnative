@@ -6,6 +6,9 @@ vertex V vs(uint id [[vertex_id]]) { float2 uv = float2((id << 1) & 2, id & 2); 
 // p[0] = source origin (texels) + source texels per destination texel, p[1] = destination origin + source level size
 fragment float4 fs(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant float4 *p [[buffer(0)]]) {
   float2 st = p[0].xy + (in.p.xy - p[1].xy) * p[0].zw; return t.sample(s, st / p[1].zw, level(0)); }
+// fs with the colour squared, sign kept (x * |x|): gamma 2 to linear, as agl's NDSR network decodes its output (copy_t2t_draw's COPY_DRAW_SQUARE, the MetalFX upscaler's UP_COLOR_SQ)
+fragment float4 fsq(V in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant float4 *p [[buffer(0)]]) {
+  float2 st = p[0].xy + (in.p.xy - p[1].xy) * p[0].zw; float4 c = t.sample(s, st / p[1].zw, level(0)); return float4(c.rgb * abs(c.rgb), c.a); }
 struct D { float d [[depth(any)]]; };
 fragment D fsd(V in [[stage_in]], depth2d<float> t [[texture(0)]], sampler s [[sampler(0)]], constant float4 *p [[buffer(0)]]) {
   float2 st = p[0].xy + (in.p.xy - p[1].xy) * p[0].zw; D o; o.d = t.read(uint2(st)); return o; }
