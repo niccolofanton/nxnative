@@ -24,13 +24,20 @@ class Alu(Translated):
 
 class FloatRed(Translated):
     """RED.F32.FTZ.RN (0x98e, type 3 at bits 73..76, add): agl's scene analysis sums luminance with it (Ocarina of Time's probe_analyze 6e28359aa3558f61). Dropped with a log line, the exposure the CPU
-    reads back from those buffers was several times too bright. A compare-and-swap loop on the word"""
+    reads back from those buffers was several times too bright. One native atomic_float add by default (DMSH_F32_ATOMIC=native), a compare-and-swap loop on the word with f32_atomic cas"""
     RED = (0x000fe20000000000 | 3 << 9, 0x0000000608ff098e)   # RED.F32.FTZ.RN [R8], R6: (control and type, opcode and registers)
 
+    def red(self, **extra): return self.translate(b''.join(inst(*waiting(i)) for i in (s2r_tid(6), s2r_tid(8), s2r_tid(9), self.RED)) + inst(*EXIT), **extra)
+
+    def test_adds_natively(self):
+        msl = self.red()
+        self.assertIn('atomic_fetch_add_explicit((device atomic_float*)', msl)
+        self.assertNotIn('atomic_compare_exchange', msl)
+
     def test_adds_in_a_loop(self):
-        msl = self.translate(b''.join(inst(*waiting(i)) for i in (s2r_tid(6), s2r_tid(8), s2r_tid(9), self.RED)) + inst(*EXIT))
+        msl = self.red(f32_atomic='cas')
         self.assertIn('atomic_compare_exchange_weak_explicit', msl)
-        self.assertNotIn('atomic_fetch_add', msl)
+        self.assertNotIn('atomic_float', msl)   # an atomic_fetch_add of 0 is the loop's read of the word (efbe4f42), not the float add
 
 
 class DeadChannel(Translated):
