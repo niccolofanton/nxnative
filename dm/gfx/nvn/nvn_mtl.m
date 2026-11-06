@@ -1684,8 +1684,13 @@ static uint64_t gpu_ticks(void) { uint64_t g = guest_ns(); if (!g) { struct time
 // In segment mode a report takes the GPU time of the segment it was encoded in (sub_cut): TIMESTAMP_TOP (0x10) that segment's GPU start, other types its GPU end. The writes stay in the last segment's handler, before the fence,
 // so a game that waits for the fence reads one submission's reports together; a segment whose feedback has not arrived by then takes the last segment's times
 #define SEG_CLK_N 1024
-struct seg_clk { _Atomic int refs; _Atomic uint64_t t[SEG_CLK_N][2]; uint32_t nb; uint16_t b[SEG_CLK_N + 1]; };   // per submission (g_sclk, allocated at its first cut): guest ns of each cut segment's GPU start / end (0 = no feedback yet); b: with ts_on, the heap slots of the segment boundaries, segment k from b[k] to b[k + 1]
+struct seg_clk { _Atomic int refs; _Atomic uint64_t t[SEG_CLK_N][2]; uint32_t nb; uint16_t b[SEG_CLK_N + 1]; uint64_t d[SEG_CLK_N + 1], d_end; uint8_t cm[SEG_CLK_N]; };   // per submission (g_sclk, allocated at its first cut): guest ns of each cut segment's GPU start / end (0 = no feedback yet); b: with ts_on, the heap slots of the segment boundaries, segment k from b[k] to b[k + 1];
+// d: the draw count (g_stat_draw) at each boundary, d_end at the commit; cm[k]: segment k ended a committed command buffer (sub_cut). d / d_end / cm are read by ts_interp's rep_ticks
 static int seg_ts(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_GPU_TS"); v = e && *e ? !strcmp(e, "segment") : DM_GAME_GPU_TS_SEGMENT; MLOG("counter timestamps: %s (profile key gpu_timestamps; DM_NVN_GPU_TS=segment / submission)", v ? "GPU start / end time of their segment" : "one time for the whole submission"); } return v; }
+// DM_NVN_TS_BOUNDARY=gpu (default) / interp, read once: what a segment boundary records. gpu: a GPU timestamp written into g_ts_heap at the start of the next encoder (ts_stamp), about 18 a frame in Ocarina of Time at
+// the default cut of 64 draws. interp: no timestamp write at all (no heap); a boundary keeps its draw count, and a report's time is placed between its command buffer's GPU start and end (commit feedback)
+// in proportion to the draws before it. Ocarina on an M1 Pro hangs the GPU in about half its routes, in command buffers where these writes were the only effect of the cuts (more cuts, more hangs)
+static int ts_interp(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TS_BOUNDARY"); v = e && !strcmp(e, "interp"); if (e && *e && !v && strcmp(e, "gpu")) MLOG("[RED] DM_NVN_TS_BOUNDARY=%s is not gpu or interp: gpu", e); MLOG("segment boundaries: %s (DM_NVN_TS_BOUNDARY=gpu / interp)", v ? "draw counts, times interpolated over the command buffer's GPU start / end" : "GPU timestamp writes"); } return v; }
 static void seg_clk_put(seg_clk *c) { if (c && atomic_fetch_sub(&c->refs, 1) == 1) free(c); }
 static uint64_t gpu_s_guest_ns(double s) {   // a feedback GPU time (seconds on the mach absolute time base) on the guest clock; 0 when unknown
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
@@ -1702,9 +1707,25 @@ static uint64_t ts_scale(uint64_t ns, uint64_t c0) {
     if (f == 1 || !c0 || ns <= c0) return ns;
     return c0 + (uint64_t)((double)(ns - c0) * f);
 }
+// ts_interp: the guest ns of boundary bi (the start of segment s = o->seg for a TIMESTAMP_TOP, its end otherwise), from the draws before it: the command buffer holding segment s runs from its first boundary's draw count
+// to its last's, on the GPU from its feedback start to end (c0 / c1 for the submission's last one); 0 when unknown (no feedback, more than SEG_CLK_N segments)
+static uint64_t ts_interp_ns(const seg_clk *sc, uint32_t s, uint32_t bi, int top, uint32_t last, uint64_t c0, uint64_t c1) {
+    if (!sc->nb || s > last || bi > sc->nb || (bi == sc->nb && s != last)) return 0;
+    uint64_t dp = bi < sc->nb ? sc->d[bi] : sc->d_end;
+    uint32_t k = s, kp = 0; while (k < last && k < SEG_CLK_N && !sc->cm[k]) k++;   // k: the committed segment that ends s's command buffer (k == last: the final one)
+    for (uint32_t j = s; j-- > 0;) if (j < SEG_CLK_N && sc->cm[j]) { kp = j + 1; break; }   // kp: its first segment
+    uint64_t t0 = c0, t1 = c1, d0 = sc->d[kp], d1;
+    if (k < last) { if (k >= SEG_CLK_N || k + 1 >= sc->nb) return 0; t0 = atomic_load(&sc->t[k][0]); t1 = atomic_load(&sc->t[k][1]); d1 = sc->d[k + 1]; }
+    else d1 = sc->d_end;
+    if (!t0 || !t1 || t1 < t0) return 0;
+    if (d1 <= d0) return top ? t0 : t1;
+    if (dp < d0) dp = d0; if (dp > d1) dp = d1;   // never before the start or after the end
+    return t0 + (uint64_t)((double)(t1 - t0) * (double)(dp - d0) / (double)(d1 - d0));
+}
 static uint64_t rep_ticks(const post_op *o, seg_clk *sc, uint32_t last, uint64_t c0, uint64_t c1) {   // the time a counter report records (614.4 MHz); c0 / c1: the last segment's GPU start / end on the guest clock
     int top = o->type == 0x10; uint64_t ns = 0;
     uint32_t bi = o->seg + !top;
+    if (sc && ts_interp() && (ns = ts_interp_ns(sc, o->seg, bi, top, last, c0, c1))) return nvn_timestamp_from_ns(ts_scale(ns, c0));
     if (sc && bi < sc->nb && g_ts_heap) {   // the boundary's own timestamp, on the guest clock through a pair of samples: how long ago it was on the GPU's clock, back from the guest clock now
         NSData *d = [g_ts_heap resolveCounterRange:NSMakeRange(sc->b[bi], 1)]; const MTL4TimestampHeapEntry *e = d.bytes; MTLTimestamp cpu = 0, gpu = 0; [g_dev sampleTimestamps:&cpu gpuTimestamp:&gpu];
         static double scale; if (!scale) { uint64_t hz = [g_dev queryTimestampFrequency]; scale = hz ? 1e9 / (double)hz : 1; }
@@ -1980,7 +2001,7 @@ uint64_t mtl_sub_commit(void) {
     uint64_t gpu_f = atomic_load(&g_cur_frame); gpu_tag_begin(gpu_f);
     NSString *cctx = @(cctx_snap());
     cbs_list *cbs = cbs_take();
-    seg_clk *sc = g_sclk; uint32_t seg_last = g_seg; g_sclk = NULL;
+    seg_clk *sc = g_sclk; uint32_t seg_last = g_seg; g_sclk = NULL; if (sc) sc->d_end = g_stat_draw;
     pthread_mutex_lock(&g_post_mu);
     if (!atomic_load(&pr->claimed) && pr->fence) MDIE("post ring: the writes of fence %llu never ran", (unsigned long long)pr->fence);
     pr->n = n; pr->ops = ops; pr->sc = sc; pr->seg_last = seg_last; pr->t_commit = guest_ns(); atomic_store(&pr->claimed, 0); atomic_store(&pr->fence, fence);
@@ -4182,12 +4203,12 @@ static id<MTL4RenderCommandEncoder> g_enc;
 // frames of 13 and 52 ms in turn. So the boundaries stay every cut_draws() draws, each with a GPU timestamp, whether or not the host commits there (sub_cut): the game reads what it read, and a GPU still busy gets no extra command buffer. The encode thread records its command
 // buffers and has no such write: with it each boundary stays a commit
 enum { TS_SLOTS = 4096 };   // the largest timestamp heap Metal makes
-static uint32_t g_ts_next; static int g_ts_state, g_ts_s0;   // state: 0 not tried, 1 on, -1 off; s0: the slot of this submission's first boundary
+static uint32_t g_ts_next; static int g_ts_state, g_ts_s0; static uint64_t g_ts_d0;   // state: 0 not tried, 1 on, -1 off; s0: the slot of this submission's first boundary; d0: the draw count there
 static int ts_on(void) {
     if (!g_ts_state) { g_ts_state = -1;
         if (seg_ts() && !rec_on()) { MTL4CounterHeapDescriptor *hd = [MTL4CounterHeapDescriptor new]; hd.type = MTL4CounterHeapTypeTimestamp; hd.count = TS_SLOTS; NSError *er = nil;
-            g_ts_heap = [g_dev newCounterHeapWithDescriptor:hd error:&er];
-            if (g_ts_heap) g_ts_state = 1; else MLOG("[RED] counter timestamps: no counter heap (%s): every segment boundary stays a commit", er.description.UTF8String); } }
+            g_ts_heap = ts_interp() ? nil : [g_dev newCounterHeapWithDescriptor:hd error:&er];   // interp: boundaries without a timestamp write, no heap
+            if (g_ts_heap || ts_interp()) g_ts_state = 1; else MLOG("[RED] counter timestamps: no counter heap (%s): every segment boundary stays a commit", er.description.UTF8String); } }
     return g_ts_state > 0;
 }
 static int ts_stamp(void) {   // no render encoder open. Written at the start of the next encoder (ts_encoder), as a write between encoders cost the GPU 0.6 ms a frame at about 8 boundaries; boundaries with nothing between them are one time
@@ -4196,14 +4217,14 @@ static int ts_stamp(void) {   // no render encoder open. Written at the start of
     if (g_blit) [g_blit writeTimestampWithGranularity:MTL4TimestampGranularityRelaxed intoHeap:g_ts_heap atIndex:(NSUInteger)slot]; else g_ts_pend = slot;
     return slot;
 }
-static void ts_sub_begin(void) { if (ts_on()) g_ts_s0 = ts_stamp(); }
+static void ts_sub_begin(void) { if (ts_on()) { g_ts_d0 = g_stat_draw; g_ts_s0 = ts_interp() ? 0 : ts_stamp(); } }
 static void ts_clk(void) {   // the submission's first report or boundary
     if (!ts_on() || g_sclk) return;
-    g_sclk = calloc(1, sizeof *g_sclk); if (!g_sclk) MDIE("segment clock allocation failed"); atomic_store(&g_sclk->refs, 1); g_sclk->b[0] = (uint16_t)g_ts_s0; g_sclk->nb = 1;
+    g_sclk = calloc(1, sizeof *g_sclk); if (!g_sclk) MDIE("segment clock allocation failed"); atomic_store(&g_sclk->refs, 1); g_sclk->b[0] = (uint16_t)g_ts_s0; g_sclk->d[0] = g_ts_d0; g_sclk->nb = 1;
 }
 static void ts_boundary(void) {   // the end of a segment and the start of the next
     if (!ts_on()) return;
-    ts_clk(); if (g_sclk->nb <= SEG_CLK_N) g_sclk->b[g_sclk->nb++] = (uint16_t)ts_stamp();
+    ts_clk(); if (g_sclk->nb <= SEG_CLK_N) { g_sclk->d[g_sclk->nb] = g_stat_draw; g_sclk->b[g_sclk->nb++] = ts_interp() ? 0 : (uint16_t)ts_stamp(); }
 }
 static int enc_open(void) { return g_enc != nil; }
 // Target info of the current render pass: determined once from the attachments at rp_begin and shared by all draws in the pass (pipeline key, depth-stencil, viewport / scissor all depend only on it)
@@ -13855,7 +13876,7 @@ static void sub_cut(void) {
     up_flush();
     uint64_t f = atomic_load(&g_cur_frame); gpu_tag_begin(f);
     uint32_t k = g_seg++; seg_clk *sc = NULL;   // reports encoded so far keep this segment's GPU times (seg_ts)
-    if (seg_ts()) { if (!g_sclk) { g_sclk = calloc(1, sizeof *g_sclk); atomic_store(&g_sclk->refs, 1); } sc = g_sclk; atomic_fetch_add(&sc->refs, 1); }
+    if (seg_ts()) { if (!g_sclk) { g_sclk = calloc(1, sizeof *g_sclk); atomic_store(&g_sclk->refs, 1); } sc = g_sclk; atomic_fetch_add(&sc->refs, 1); if (k < SEG_CLK_N) sc->cm[k] = 1; }
     cbs_list *cbs = cbs_take(); uint64_t cbs_fence = g_fence + 1;
     MTL4CommitOptions *o = [MTL4CommitOptions new];
     atomic_fetch_add(&g_seg_inflight, 1);

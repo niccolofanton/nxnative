@@ -478,6 +478,7 @@ static const struct { const char *name, *value; int on; } k_preset_m1[] = {
     {"DM_UPSCALER", "metalfx", 1},          // NDSR network off: PR #1456 HMMA chains streak on M1; MetalFX (gamma-2 fix 7a951791) matches its tone, same GPU cost
     {"DM_NVN_GPU_TS_SCALE", "0.6", 1},      // dynamic resolution 683x384 floor -> 1536x864 max in Link's house for +5 ms (p50 23.8 -> 28.5 ms, 42 -> 35 FPS, 0 frames > 33 ms);
                                             // costs nothing in Kokiri (stays at the floor, about 39.5 ms either way)
+    {"DM_NVN_TS_BOUNDARY", "interp", 0},    // enable if the A/B confirms timestamp writes cause the Apple7 hangs
 };
 // DM_PRESET=auto (default): this game on an Apple7-family GPU; m1: this game on any GPU; off: nothing. Runs before main, after front_hud_env (the GPU query makes the
 // process's first Metal device, which reads MTL_HUD_ENABLED)
