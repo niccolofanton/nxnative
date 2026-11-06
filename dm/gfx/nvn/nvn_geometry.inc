@@ -654,6 +654,38 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
 // DrawMeshTasksIndirect: {count, first}, which the game's culling writes earlier in the submission, while Metal's indirect mesh draw takes {x, y, z}. mdx_run copies the count to a {count, 1, 1} on the
 // GPU, before the render pass and for every such draw up to the next write, and the shader reads first from the record. Reading the record on the CPU instead took a wait for the GPU at each hazard:
 // 73 % of the submit thread in Ocarina of Time's Kokiri Forest, frames of 90 ms and more against 25 ms of GPU work
+// DM_NVN_TS_RANGELOG (diagnostic): at each task draw of agl's bucketed task shaders 47f9b38490dcf9a2 / 99280b7b8aae78df, the task groups whose bucket is empty. Each group reads
+// idx = word tg + 16 of one storage buffer and the 64-bit pointer P in words 0..1 of the other (47f9: idx in slot 0, P in slot 1; 9928 the other way round), then cnt = P[1] and its
+// range start = P[idx + 8 + cnt], end = P[idx + 9 + cnt]; an empty range loops 2^27 times (unsigned (min(end - start, 256) - 1) >> 5 in the guest code). The game never draws one,
+// so a line here is a draw whose count or table disagrees. `1` reads guest memory as it is when the draw is encoded (the GPU work before it in this submission not run yet);
+// `2` first waits for the GPU (mdi_wait: slow, changes timing) and also compares the count the GPU copy holds (mdx_run) with the record's. Lines are capped at 200
+static void ts_rangelog(const p_draw *dw, NvShader *ts) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_TS_RANGELOG"); on = e ? atoi(e) : 0; if (on) MLOG("DM_NVN_TS_RANGELOG=%d: empty buckets of agl's task draws are logged%s", on, on > 1 ? " (after a wait for the GPU at each)" : ""); }
+    if (!on || !ts || !ts->key) return;
+    int k47 = !strncmp(ts->key, "47f9b38490dcf9a2", 16), k99 = !strncmp(ts->key, "99280b7b8aae78df", 16);
+    if (!k47 && !k99) return;
+    static uint64_t draws, bad, lines; draws++;
+    if (on > 1) mdi_wait();
+    #define TSR_LD(A, V) (nvn_host_readable((A), sizeof(V)) ? (memcpy(&(V), (const void *)(uintptr_t)(A), sizeof(V)), 1) : 0)
+    uint32_t count = (uint32_t)dw->count, first = (uint32_t)dw->first, copy = ~0u;
+    if (dw->ind) { if (!TSR_LD(dw->ind, count) || !TSR_LD(dw->ind + 4, first)) { if (lines < 200) { lines++; MLOG("[tsrange] %s record %#llx unreadable", ts->key, (unsigned long long)dw->ind); } return; }
+        const uint32_t *oc = on > 1 ? mdx_copy_cpu(dw->ind, dw->ind) : NULL; if (oc) copy = oc[0]; }
+    const p_bind_buf *pb = &S.ssbo[3][k47 ? 1 : 0], *ib = &S.ssbo[3][k47 ? 0 : 1];
+    uint64_t P = 0; uint32_t cnt = 0;
+    if (!pb->addr || !TSR_LD(pb->addr, P) || !TSR_LD(P + 4, cnt)) { if (lines < 200) { lines++; MLOG("[tsrange] %s pointer buffer %#llx / P %#llx unreadable (ssbo0 %#llx ssbo1 %#llx)", ts->key, (unsigned long long)pb->addr, (unsigned long long)P, (unsigned long long)S.ssbo[3][0].addr, (unsigned long long)S.ssbo[3][1].addr); } return; }
+    uint64_t A = P + 4 * (8 + (uint64_t)cnt);
+    uint32_t n = MIN(copy != ~0u ? MAX(count, copy) : count, 65535u), empty = 0, unread = 0, e_tg = 0, e_idx = 0, e_v = 0;
+    for (uint32_t i = 0; i < n; i++) { uint32_t tg = first + i, idx, r[2];
+        if (!ib->addr || !TSR_LD(ib->addr + 4 * ((uint64_t)tg + 16), idx) || !TSR_LD(A + 4 * (uint64_t)idx, r)) { unread++; continue; }
+        if (r[1] == r[0]) { if (!empty++) { e_tg = tg; e_idx = idx; e_v = r[0]; } } }
+    #undef TSR_LD
+    if (empty || unread || (copy != ~0u && copy != MIN(count, 65535u))) {
+        bad++;
+        if (lines < 200) { lines++; MLOG("[tsrange] F%llu pass %llu %s%s count %u copy %d first %u: P %#llx cnt %u, %u of %u groups empty (first tg %u idx %u start=end %u), %u unreadable; %llu of %llu draws so far",
+            (unsigned long long)atomic_load(&g_cur_frame), g_stat_pass, ts->key, dw->ind ? " indirect" : "", count, copy == ~0u ? -1 : (int)copy, first, (unsigned long long)P, cnt, empty, n, e_tg, e_idx, e_v, unread,
+            (unsigned long long)bad, (unsigned long long)draws); }
+    }
+}
 static void mesh_tasks_draw(const p_draw *dw) {
     if (!S.prog || (!dw->ind && dw->count <= 0)) return;
     { static int skip = -1; if (skip < 0) { const char *e = getenv("DM_NVN_SKIP_MESH"); skip = e && atoi(e); if (skip) MLOG("DM_NVN_SKIP_MESH: task / mesh draws dropped (diagnostic; the picture is wrong)"); } if (skip) return; }   // diagnostic: what the task / mesh draws cost in all
@@ -671,6 +703,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
         if (!mdx_find(dw->ind, dw->ind, &ind)) { mdx_run(dw, NULL); if (!mdx_find(dw->ind, dw->ind, &ind)) ind = 0; }
         if (!ind || !mtl_gpu_addr(dw->ind, 8, &mb, &mo, &ind_first)) { RED_ONCE(154, "DrawMeshTasksIndirect record at %#llx is in no memory pool: draw skipped", (unsigned long long)dw->ind); return; }
         ind_first += 4; }
+    ts_rangelog(dw, ts);
     g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count;
     g_mtk.ind = ind; g_mtk.ind_first = ind_first;
     g_geo_program = raster;
@@ -678,7 +711,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
     draw_(&triangle, NULL);
     g_geo_program = nil; g_mtk.on = 0; args_dirty_all();
     if (g_mtk.miss) { g_mtk_wait++; return; }
-    swrite_note(pr); g_wr_epoch++;
+    swrite_note(pr); g_wr_epoch++; mdx_note_writes(pr);   // its task / mesh / fragment storage writes end the record copies they can reach (DM_NVN_MDX_SAFE)
     if (!g_mtk_n++) MLOG("task / mesh: first draw, task %s mesh %s fragment %s, %u workgroups from %u%s", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", g_mtk.count, g_mtk.first, ind ? " (indirect)" : "");
 }
 static uint64_t g_geo_mesh_n, g_geo_mesh_wait;   // mesh draws; draws the compute path drew while their mesh pipeline was built

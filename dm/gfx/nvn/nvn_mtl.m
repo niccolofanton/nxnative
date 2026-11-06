@@ -11922,8 +11922,38 @@ static int mdi_live(uint64_t cnt, int i) { return (uint32_t)i < mdi_count(cnt); 
 // (Kamura Village draws the same records with two counts between the same writes: keyed by the record alone, the second multi-draw found no copy and waited for the GPU each frame)
 #define MDX_SLOTS 16384   // a power of two; a scan fills at most a quarter
 static const p_multi_draw *g_mdx_range;   // only while replaying a compact range through the GPU mask
-typedef struct { uint64_t ind, cnt, out, tag; } mdx_ent;   // out: GPU address of the copy, 0 when the record or count is in no Metal buffer (those draws wait, mdi_live)
+typedef struct { uint64_t ind, cnt, out, tag; const uint32_t *oc; } mdx_ent;   // out: GPU address of the copy, 0 when the record or count is in no Metal buffer (those draws wait, mdi_live); oc: the copy on the CPU
 static mdx_ent g_mdx[MDX_SLOTS]; static int g_mdx_n; static uint64_t g_mdx_tag = 1, g_mdx_ep = ~0ull, g_mdx_sub, g_mdx_runs, g_mdx_splits, g_mdx_draws, g_mdx_fast; static const uint8_t *g_mdx_stop;
+// DM_NVN_MDX_SAFE (default 1): the copies are made ahead of the draws that use them, up to the next dispatch, copy, fill or texture → buffer copy; a draw with shader storage writes did not end
+// them. Ocarina of Time's task shaders write the next task draw's {count, first} record and its bucket table: the next draw's count was copied before the draw that wrote it ran, so it
+// drew a stale count against a fresh table, its extra task groups found empty buckets, and the guest loop over (min(end - start, 256) - 1) >> 5 ran 2^27 times (the GPU hung, M1 Pro).
+// With it, a draw (task / mesh draws too) whose storage writes can reach a copied record or count ends the copies (g_mdx_epoch: the draws after it copy again, after it on the GPU), and
+// so does a game barrier with ORDER_INDIRECT_DATA (the game says indirect data written before it is read after it); the lookahead also stops there
+static int mdx_safe(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_MDX_SAFE"); v = !e || atoi(e); if (!v) MLOG("DM_NVN_MDX_SAFE=0: indirect record copies are not ended by draws with storage writes or indirect-data barriers"); } return v; }
+enum { MDX_RN = 32 };
+static uint64_t g_mdx_rlo[MDX_RN], g_mdx_rhi[MDX_RN], g_mdx_safe_ends; static int g_mdx_rn;   // the records and counts copied in this tag (merged; the last range takes the overflow)
+static void mdx_rng_add(uint64_t lo, uint64_t hi) {
+    for (int i = 0; i < g_mdx_rn; i++) if (lo <= g_mdx_rhi[i] + 256 && g_mdx_rlo[i] <= hi + 256) { g_mdx_rlo[i] = MIN(lo, g_mdx_rlo[i]); g_mdx_rhi[i] = MAX(hi, g_mdx_rhi[i]); return; }
+    if (g_mdx_rn == MDX_RN) { g_mdx_rlo[MDX_RN - 1] = MIN(lo, g_mdx_rlo[MDX_RN - 1]); g_mdx_rhi[MDX_RN - 1] = MAX(hi, g_mdx_rhi[MDX_RN - 1]); return; }
+    g_mdx_rlo[g_mdx_rn] = lo; g_mdx_rhi[g_mdx_rn++] = hi;
+}
+static int mdx_rng_hit(uint64_t lo, uint64_t hi) { for (int i = 0; i < g_mdx_rn; i++) if (lo < g_mdx_rhi[i] && g_mdx_rlo[i] < hi) return 1; return 0; }
+// After a draw is encoded: its storage writes (the bound storage buffers' ranges; a pointer through the pool table or a uniform, the rest of its buffer or anywhere) against the copies
+// still valid. Image writes are left out (textures, not records)
+static void mdx_note_writes(NvProg *pr) {
+    if (!pr || !g_mdx_rn || g_mdx_ep != g_mdx_epoch || g_mdx_sub != g_sub_serial || !mdx_safe()) return;
+    for (int st = 0; st < 5; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;
+        for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; if (!b->rw) continue;
+            int reg = b->reg; uint64_t lo = 0, hi = ~0ull, addr = 0, sz = 0; void *mb; uint64_t mo, gpu;
+            if (b->kind == NVN_RB_SBUFP) { if (reg < 32 && (sh->sb_ro >> reg & 1)) continue; if (reg >= 16 || !S.ssbo[st][reg].addr) continue; addr = S.ssbo[st][reg].addr; sz = S.ssbo[st][reg].size; }
+            else if (b->kind == NVN_RB_SBUFU) { ubo_read(st, reg, b->off, 8, &addr); if (!addr) continue; }
+            else if (b->kind != NVN_RB_GMEM) continue;
+            if (addr) { lo = addr; hi = mtl_gpu_addr(addr, 1, &mb, &mo, &gpu) ? addr + MAX(sbw_len(sz, mb, mo), 1) : ~0ull; }
+            if (!mdx_rng_hit(lo, hi)) continue;
+            g_mdx_epoch++; g_mdx_safe_ends++;
+            static int once; if (!once++) MLOG("indirect record copies ended by a draw's storage writes (DM_NVN_MDX_SAFE): first case pass %llu, stage %d %s binding kind %d at %#llx", g_stat_pass, st, sh->key, b->kind, (unsigned long long)addr);
+            return; } }
+}
 // The kernel mdx_mask: dm/gfx/msl/mdx.metal
 static int mdx_wanted(const p_draw *dw, const p_draw_idx *di) { return dw ? dw->mdi_cnt && !ixc_wanted(dw, NULL) : di->mdi_cnt && !ixc_wanted(NULL, di); }
 static mdx_ent *mdx_slot(uint64_t ind, uint64_t cnt) {   // its entry in this tag, or the free slot for it
@@ -11934,6 +11964,10 @@ static int mdx_find(uint64_t ind, uint64_t cnt, uint64_t *out) {   // → 1 when
     const mdx_ent *e = mdx_slot(ind, cnt); if (e->tag != g_mdx_tag) return 0;
     *out = e->out; return 1;
 }
+static const uint32_t *mdx_copy_cpu(uint64_t ind, uint64_t cnt) {   // the copy mdx_run made for this draw, on the CPU (valid once the GPU ran it), or NULL
+    if (g_mdx_ep != g_mdx_epoch || g_mdx_sub != g_sub_serial) return NULL;
+    const mdx_ent *e = mdx_slot(ind, cnt); return e->tag == g_mdx_tag && e->out ? e->oc : NULL;
+}
 static void mdx_run(const p_draw *dw, const p_draw_idx *di) {
     static id<MTLComputePipelineState> ps; static id<MTL4ArgumentTable> at; static int failed;
     if (failed) return;
@@ -11941,7 +11975,7 @@ static void mdx_run(const p_draw *dw, const p_draw_idx *di) {
         ps = f ? [g_dev newComputePipelineStateWithFunction:f error:&e] : nil;
         MTL4ArgumentTableDescriptor *ad = [MTL4ArgumentTableDescriptor new]; ad.maxBufferBindCount = 1; at = ps ? rec_table([g_dev newArgumentTableWithDescriptor:ad error:&e]) : nil;
         if (!at) { failed = 1; MLOG("[RED] indirect-count multi-draw masking: cannot create the compute pipeline %s (those draws wait for the GPU)", e.localizedDescription.UTF8String); return; } }
-    if (g_mdx_ep != g_mdx_epoch || g_mdx_sub != g_sub_serial || g_mdx_n > MDX_SLOTS / 4) { g_mdx_tag++; g_mdx_n = 0; g_mdx_ep = g_mdx_epoch; g_mdx_sub = g_sub_serial; }
+    if (g_mdx_ep != g_mdx_epoch || g_mdx_sub != g_sub_serial || g_mdx_n > MDX_SLOTS / 4) { g_mdx_tag++; g_mdx_n = 0; g_mdx_rn = 0; g_mdx_ep = g_mdx_epoch; g_mdx_sub = g_sub_serial; }
     enum { QMAX = MDX_SLOTS / 4 };
     static struct { mdx_ent *e; uint32_t i, words; } q[QMAX]; int nq = 0;
     uint64_t lo = ~0ull, hi = 0;   // the hull of the records and counts taken, for the uniform update check
@@ -11959,6 +11993,7 @@ static void mdx_run(const p_draw *dw, const p_draw_idx *di) {
         const uint8_t *p; op_hdr h; const void *a;
         for (int guard = 0; guard < 200000 && nq < QMAX && fz_next(&cur, &p, &h, &a); guard++) {
             if (h.op == OP_DISPATCH || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF || h.op == OP_COPY_T2B) break;
+            if (h.op == OP_BARRIER && mdx_safe()) { int32_t bits; memcpy(&bits, a, 4); if (bits & NVN_BARRIER_ORDER_INDIRECT_DATA_BIT) break; }   // the replay ends the copies there
             if (h.op == OP_UPDATE_UB) { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
                 int hit = 0; for (int k = 0; d < hi && lo < d + n && k < nq && !hit; k++) { const mdx_ent *e = q[k].e; hit = (d < e->ind + 4 * q[k].words && e->ind < d + n) || (d < e->cnt + 4 && e->cnt < d + n); }
                 if (hit) { g_mdx_stop = p; break; } continue; }
@@ -11979,7 +12014,8 @@ static void mdx_run(const p_draw *dw, const p_draw_idx *di) {
     memset(j, 0, (size_t)nj * sizeof(mjob));
     for (int k = 0; k < nq; k++) { mdx_ent *e = q[k].e; void *mb; uint64_t mo, rg, cg;
         if (!mtl_gpu_addr(e->ind, 4 * (q[k].words ? q[k].words : 2), &mb, &mo, &rg) || !mtl_gpu_addr(e->cnt, 4, &mb, &mo, &cg)) continue;
-        e->out = og + 32 * (uint64_t)k; j[k] = (mjob){rg, cg, e->out, q[k].i, q[k].words}; }
+        e->out = og + 32 * (uint64_t)k; e->oc = (const uint32_t *)((uint8_t *)ab.contents + ao + (size_t)nj * sizeof(mjob) + 32 * (size_t)k); j[k] = (mjob){rg, cg, e->out, q[k].i, q[k].words};
+        mdx_rng_add(e->ind, e->ind + 4 * (q[k].words ? q[k].words : 2)); mdx_rng_add(e->cnt, e->cnt + 4); }
     id<MTL4ComputeCommandEncoder> ce = enc_c_begin(NULL); [ce setArgumentTable:at]; [at setAddress:ab.gpuAddress + ao atIndex:0]; [ce setComputePipelineState:ps];
     [ce dispatchThreadgroups:MTLSizeMake((NSUInteger)nj / 64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     enc_c_end(ce);
@@ -12552,6 +12588,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
 #endif
     udc_note_draw(pr, raster_mask);
     swrite_note(pr); order_note(pr);
+    if (!g_mtk.on && !g_geo_mesh.on) mdx_note_writes(pr);   // a task / mesh draw notes its own program's (mesh_tasks_draw); a geometry kernel ends the copies anyway
     if (g_mtk.on) { mtk_encode(en); return; }
     if (g_geo_mesh.on) { geo_mesh_encode(en); return; }
     if (g_geo_program) {
@@ -14127,7 +14164,9 @@ void mtl_exec(const uint8_t *p) {
                 PD("I %llu barrier bits %#x%s", g_stat_pass, bits, split ? ": ends the pass (shader writes)" : order ? " (render pass open; a later shader write is ordered after its draws)" : g_enc ? " (render pass open)" : "");
                 if (split) { rp_end(); static int once; if (!once++) MLOG("a game barrier (bits %#x) after shader writes in a draw pass: the pass ends there (first case pass %llu)", bits, (unsigned long long)g_stat_pass); }
                 else if (order) g_pass_order |= (bits & NVN_BARRIER_ORDER_PRIMITIVES_BIT ? 1 : 0) | (bits & (NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT) ? 2 : 0);
-                if (bits) { g_game_barrier = 1; g_fb_bar++; } break; }   // g_fb_bar: snapshots taken before it are stale (see fb_prepare)
+                if (bits) { g_game_barrier = 1; g_fb_bar++; }
+                if ((bits & NVN_BARRIER_ORDER_INDIRECT_DATA_BIT) && mdx_safe()) { g_mdx_epoch++; g_mdx_stop = NULL; }   // indirect data written before it: copies made ahead of it are stale (mdx_run)
+                break; }   // g_fb_bar: snapshots taken before it are stale (see fb_prepare)
             case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: state_op(h.op, a); break;
             default: break;
         }
