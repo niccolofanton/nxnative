@@ -2,6 +2,7 @@ using Ryujinx.Graphics.Shader.Decoders;
 using Ryujinx.Graphics.Shader.IntermediateRepresentation;
 using Ryujinx.Graphics.Shader.Translation;
 using System.Numerics;
+using static Ryujinx.Graphics.Shader.Instructions.InstEmitAluHelper;
 using static Ryujinx.Graphics.Shader.Instructions.InstEmitHelper;
 using static Ryujinx.Graphics.Shader.IntermediateRepresentation.OperandHelper;
 
@@ -209,7 +210,8 @@ namespace Ryujinx.Graphics.Shader.Instructions
             context.MarkLabel(lblRetry);
 
             Operand expected = context.Load(storageKind, e0, e1);
-            Operand sum = context.FPAdd(expected, value);
+            // .FTZ: denormal inputs and the result flush to zero, as the Switch's RED / ATOMG .ADD.F32.FTZ.RN does
+            Operand sum = FlushDenormal(context, context.FPAdd(FlushDenormal(context, expected), FlushDenormal(context, value)));
             Operand found = context.AtomicCompareAndSwap(storageKind, e0, e1, expected, sum);
 
             context.BranchIfTrue(lblRetry, context.ICompareNotEqual(found, expected));
