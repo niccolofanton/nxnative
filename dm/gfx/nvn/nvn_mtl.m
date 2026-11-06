@@ -1287,6 +1287,8 @@ static void blit_note(void);   // Per-pass dump: a copy / buffer update ended th
 // allocator gave out overlapping blocks, see hle_nvn.c zcull_size; NVN runs copies in order for any game)
 enum { BW_MAX = 64 };
 static uint64_t g_bw_lo[BW_MAX], g_bw_hi[BW_MAX], g_br_lo[BW_MAX], g_br_hi[BW_MAX]; static int g_bw_n, g_br_n, g_blit_ops; static uint64_t g_blit_barriers;
+static int g_blit_disponly = 1;   // since the copy encoder's last barrier only the game's dispatches went into it (dispatch_enc)
+static int g_cs_gbar;             // the game called nvnCommandBufferBarrier since its last dispatch (dispatch_enc)
 static uint64_t g_blit_splits;   // copies / buffer updates / fills that ended an open draw pass (the residency set line; a pass ended this way stores and the next one reloads its attachments)
 uint64_t mtl_blit_splits(void) { return g_blit_splits; }
 static int enc_open(void);
@@ -1306,7 +1308,7 @@ static void blit_barrier(void) {
     static int off = -1; if (off < 0) { const char *e = getenv("DM_NVN_BLIT_ORDER"); off = e && !strcmp(e, "0"); if (off) MLOG("DM_NVN_BLIT_ORDER=0: no barriers inside the copy encoder (diagnostic; brings back the fountain's vertical stripes)"); }
     // Only the stages a compute encoder has: MTLStageAll here fails Metal validation (macOS 27: "must be a valid combination of MTLStages for the current encoder type")
     if (!off) [g_blit barrierAfterEncoderStages:MTLStageDispatch | MTLStageBlit beforeEncoderStages:MTLStageDispatch | MTLStageBlit visibilityOptions:blit_vis()];
-    g_bw_n = g_br_n = 0; g_blit_ops = 0; g_blit_barriers++;
+    g_bw_n = g_br_n = 0; g_blit_ops = 0; g_blit_barriers++; g_blit_disponly = 1;
 }
 uint64_t mtl_blit_barriers(void) { return g_blit_barriers; }
 static int bw_hit(uint64_t lo, uint64_t hi) { for (int i = 0; i < g_bw_n; i++) if (lo < g_bw_hi[i] && g_bw_lo[i] < hi) return 1; return 0; }
@@ -1345,7 +1347,7 @@ static id<MTL4ComputeCommandEncoder> blit_buf(uint64_t rlo, uint64_t rhi, uint64
     // range-based batching, including separate Metal buffers over one CPU range.
     if (nvn_sparse_alias(rlo, rhi) || nvn_sparse_alias(wlo, whi)) { wlo = 0; whi = ~0ull; }
     if (g_blit_ops && (g_bw_n == BW_MAX || g_br_n == BW_MAX || (rhi > rlo && bw_hit(rlo, rhi)) || bw_hit(wlo, whi) || br_hit(wlo, whi))) blit_barrier();
-    g_bw_lo[g_bw_n] = wlo; g_bw_hi[g_bw_n++] = whi; g_blit_ops++; g_gp_copies++;
+    g_bw_lo[g_bw_n] = wlo; g_bw_hi[g_bw_n++] = whi; g_blit_ops++; g_gp_copies++; g_blit_disponly = 0;
     if (rhi > rlo) { g_br_lo[g_br_n] = rlo; g_br_hi[g_br_n++] = rhi; }
     return e;
 }
@@ -1353,7 +1355,7 @@ static id<MTL4ComputeCommandEncoder> blit_buf(uint64_t rlo, uint64_t rhi, uint64
 static id<MTL4ComputeCommandEncoder> blit(void) {
     id<MTL4ComputeCommandEncoder> e = blit_raw();
     if (g_blit_ops) blit_barrier();
-    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // record as "everything written": the next operation always gets a barrier
+    g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1; g_blit_disponly = 0;   // record as "everything written": the next operation always gets a barrier
     return e;
 }
 
@@ -12842,6 +12844,12 @@ static int dispatch_own(void) {
     if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_OWN"); v = (e && !strcmp(e, "1")) || pg_on(); if (v) MLOG("compute dispatches: each in an encoder of its own (DM_NVN_DISPATCH_OWN=1 or DM_NVN_PASSGPU)"); }
     return v;
 }
+// DM_NVN_DISPATCH_OVERLAP (profile key dispatch_overlap): two of the game's dispatches with nothing between them in the copy encoder and no nvnCommandBufferBarrier of the game's
+// between them run side by side, as NVN lets them: it orders a dispatch after earlier work only through a barrier. A copy, fill or inline update between them, a host dispatch
+// (dispatch_enc's game 0) or a game barrier keeps the barrier, and what comes after a dispatch other than a dispatch still waits for it (everything written). Ocarina of Time runs
+// 117 dispatches at the start of a frame in Kokiri Forest, each waiting for the one before: 5.7 ms; with no barrier between any of them 2.6 ms
+static uint64_t g_disp_beside, g_disp_ordered; static int g_disp_last_beside;
+static int dispatch_overlap(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_OVERLAP"); v = e ? atoi(e) != 0 : DM_GAME_DISPATCH_OVERLAP; if (v) MLOG("dispatch overlap: the game's dispatches with no barrier of its between them run side by side (DM_NVN_DISPATCH_OVERLAP=0 orders each after the one before)"); } return v; }
 // Compute dependencies (DM_NVN_CS_DEPS=1, off by default; read again every 1,024 dispatches so a DM_CTL "env DM_NVN_CS_DEPS=…" line A/Bs it mid-run). Metal 4 tracks no hazards inside
 // an encoder: dispatches with no barrier between them may run at the same time, so a dependent one needs barrierAfterEncoderStages (blit_barrier). By default every dispatch is recorded as
 // "everything written" and the next copy or dispatch always waits for it: Ocarina of Time's frames open with about 114 dispatches of some 70 programs (foliage first), serialized, ~9-10 ms
@@ -12920,20 +12928,26 @@ static void csd_window(void) {   // the counters, every 3,600 frames
         (unsigned long long)g_csd_frame, (unsigned long long)f, (unsigned long long)(g_csd_barrier + g_csd_saved), (unsigned long long)g_csd_barrier, (unsigned long long)g_csd_saved, (unsigned long long)g_csd_full, (unsigned long long)g_csd_full_bar);
     g_csd_frame = f; g_csd_barrier = g_csd_saved = g_csd_full = g_csd_full_bar = 0;
 }
-// d: the dispatch's ranges (csd_collect); NULL = everything, as host kernels and indirect dispatches are
-static id<MTL4ComputeCommandEncoder> dispatch_enc(const cs_deps *d) {
+// d: the dispatch's ranges (csd_collect, DM_NVN_CS_DEPS=1; only a game dispatch has them); NULL = everything: the host's own dispatches, indirect ones and the ones csd_collect refuses, ordered as before
+// (dispatch_overlap: beside the game's dispatches before it when no game barrier lies between; otherwise after a barrier). With ranges the barrier comes only on an overlap, and a game barrier of its own does not add one
+static id<MTL4ComputeCommandEncoder> dispatch_enc(int game, const cs_deps *d) {   // game: one of the game's dispatches (0: the host's own, ordered as a copy is)
     id<MTL4ComputeCommandEncoder> e = blit_open(); g_gp_disp++;
     if (!d) {
-        if (g_blit_ops) { blit_barrier(); g_csd_full_bar++; }
+        int beside = game && g_blit_ops && g_blit_disponly && !g_cs_gbar && dispatch_overlap();
+        if (g_blit_ops && !beside) { blit_barrier(); g_csd_full_bar++; }
         g_csd_full++;
-        g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1;   // recorded as "everything written": the next copy or dispatch gets a barrier
+        if (game) { g_disp_last_beside = beside; if (beside) g_disp_beside++; else g_disp_ordered++; g_cs_gbar = 0; }
+        g_bw_lo[0] = 0; g_bw_hi[0] = ~0ull; g_bw_n = 1; g_br_n = 0; g_blit_ops = 1; g_blit_disponly = game;   // recorded as "everything written": the next copy, or a dispatch after a game barrier, gets a barrier
     } else {
+        int bar = 0;
         if (g_blit_ops) {
             int hit = g_bw_n + d->nw > BW_MAX || g_br_n + d->nr > BW_MAX;   // no room: start the lists again after a barrier
             for (int i = 0; !hit && i < d->nr; i++) hit = bw_hit(d->rlo[i], d->rhi[i]);
             for (int i = 0; !hit && i < d->nw; i++) hit = bw_hit(d->wlo[i], d->whi[i]) || br_hit(d->wlo[i], d->whi[i]);
             if (hit) { blit_barrier(); g_csd_barrier++; } else g_csd_saved++;
+            bar = hit;
         }
+        if (game) { g_disp_last_beside = g_blit_ops && !bar; if (g_disp_last_beside) g_disp_beside++; else g_disp_ordered++; g_cs_gbar = 0; }
         for (int i = 0; i < d->nw; i++) { g_bw_lo[g_bw_n] = d->wlo[i]; g_bw_hi[g_bw_n++] = d->whi[i]; }   // both fit: at most BW_MAX each (csd_add), and the lists were emptied when they would not
         for (int i = 0; i < d->nr; i++) { g_br_lo[g_br_n] = d->rlo[i]; g_br_hi[g_br_n++] = d->rhi[i]; }
         g_blit_ops++;   // texture copies (blit) still wait for it
@@ -13124,7 +13138,8 @@ static void dispatch(const p_dispatch *dp) {
     if (own && g_blit) { enc_b_end(g_blit); g_blit = nil; }
     cs_deps deps; const cs_deps *dd = NULL;
     if (!own && csd_on()) { if (!dp->ind) dd = csd_collect(cs, &deps); csd_window(); }   // indirect: its group counts come through copies and the clamp kernel in the encoder, recorded as everything
-    id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc(dd);
+    id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc(1, dd);
+    PD("X %llu dispatch %s groups %llux%llux%llu%s%s", g_stat_pass, cs->key, (unsigned long long)dp->x, (unsigned long long)dp->y, (unsigned long long)dp->z, dp->ind ? " indirect" : "", own ? " (own encoder)" : g_disp_last_beside ? " beside the one before" : " after a barrier");
     if (dp->ind && dpc_on()) {   // the GPU-written group counts, clamped into the frame arena first (see dpc_clamp); the dispatch and the c0 copy below read the clamped ones
         uint64_t cg; __strong id<MTLBuffer> cb_ = nil; size_t co;
         if (dpc_clamp_enc(ce, ig, &cb_, &co, &cg)) { ib = (__bridge void *)cb_; io = co; ig = cg; }
@@ -13172,7 +13187,7 @@ static int rb_swap_gpu(uint64_t src, size_t row, size_t img, uint64_t dst, size_
     id<MTLBuffer> pb; size_t po = arena_alloc(48, &pb);
     struct { uint64_t s, d; uint32_t w, h, row, img, drow, dimg, shift; } *p = (void *)((uint8_t *)pb.contents + po);
     *p = (typeof(*p)){src, dst, (uint32_t)(wb / 2), (uint32_t)rows, (uint32_t)row, (uint32_t)img, (uint32_t)drow, (uint32_t)dimg, (uint32_t)shift};
-    id<MTL4ComputeCommandEncoder> e = dispatch_enc(NULL);
+    id<MTL4ComputeCommandEncoder> e = dispatch_enc(0, NULL);
     [g_ct setAddress:pb.gpuAddress + po atIndex:0]; enc_c_pso(e, ps);
     enc_c_dispatch(e, MTLSizeMake((wb / 2 + 63) / 64, rows, nz), MTLSizeMake(64, 1, 1));
     static int once; if (!once++) MLOG("RGB565-family copy between guest memory and a host texture: red and blue exchanged on the GPU (first case %zux%zux%zu texels)", wb / 2, rows, nz);
@@ -14243,9 +14258,9 @@ void mtl_exec(const uint8_t *p) {
                 PD("I %llu barrier bits %#x%s", g_stat_pass, bits, split ? ": ends the pass (shader writes)" : order ? " (render pass open; a later shader write is ordered after its draws)" : g_enc ? " (render pass open)" : "");
                 if (split) { rp_end(); static int once; if (!once++) MLOG("a game barrier (bits %#x) after shader writes in a draw pass: the pass ends there (first case pass %llu)", bits, (unsigned long long)g_stat_pass); }
                 else if (order) g_pass_order |= (bits & NVN_BARRIER_ORDER_PRIMITIVES_BIT ? 1 : 0) | (bits & (NVN_BARRIER_ORDER_FRAGMENTS_BIT | NVN_BARRIER_ORDER_FRAGMENTS_TILED_BIT) ? 2 : 0);
-                if (bits) { g_game_barrier = 1; g_fb_bar++; }
+                if (bits) { g_game_barrier = 1; g_fb_bar++; g_cs_gbar = 1; }
                 if ((bits & NVN_BARRIER_ORDER_INDIRECT_DATA_BIT) && mdx_safe()) { g_mdx_epoch++; g_mdx_stop = NULL; }   // indirect data written before it: copies made ahead of it are stale (mdx_run)
-                break; }   // g_fb_bar: snapshots taken before it are stale (see fb_prepare)
+                break; }   // g_fb_bar: snapshots taken before it are stale (see fb_prepare); g_cs_gbar: dispatch_enc
             case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: state_op(h.op, a); break;
             default: break;
         }
