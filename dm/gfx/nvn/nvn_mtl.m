@@ -947,6 +947,7 @@ static void treg_finish_submission(void);
 static void ghost_finish_submission(void);
 
 static uint64_t g_sub_serial;   // Submission index (used by the parallel precompile's 'predict only once per submission')
+static id<MTLTexture> g_ndve_decoded;   // colour conversion and final movie scale must belong to the same submission
 // The first submission: the prepare step (warm_start), before anything of it is encoded. No GPU work: the submit entry (hle_nvn.c) calls it outside the graphics gate
 void mtl_prepare(void) {
     if (!g_warm_started && prepare_on()) { mtl_init(); shmap_load(); }
@@ -957,6 +958,7 @@ static void alias_retake(void);
 static void alias_retire_idle(void);   // shared textures nothing live resolves to any more, when memory runs short (below)
 void mtl_sub_begin(void) {
     mtl_init(); g_sub_serial++; g_seg = 0; seg_clk_put(g_sclk); g_sclk = NULL; g_rc_npend = 0; g_rc_skip = 0;
+    g_ndve_decoded = nil;
     sub_cut_begin();
     defer_drain();
     alias_retire_idle();
@@ -12460,6 +12462,45 @@ static int up_chain_role(NvShader *cs) {   // 1 a stage before the last (2: the 
     for (const char *k = c; k < last; k += 17) if (!strncmp(k, cs->key, 16)) return k == c ? 2 : 1;
     return 0;
 }
+
+// Ocarina's NDVE movie path converts NV12 to RGBA before reconstruction. The final
+// movie dispatch can scale that clean image directly into its normal output.
+static int ndve_direct_draw(NvShader *cs);
+static int ndve_direct_role(NvShader *cs) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("DM_NVN_NDVE_MOVIE_DIRECT");
+        enabled = e && !strcmp(e, "1");
+    }
+    if (!enabled) return 0;
+    if (!strcmp(cs->key, "49dff010b9832251_b")) return 1;
+    if (!strcmp(cs->key, "4f41ccf24f163e0d_b")) return 2;
+    return 0;
+}
+static id<MTLTexture> ndve_image(NvShader *cs, unsigned slot, tex_t *desc) {
+    int tid = (int)(S.img[5][slot] & 0xfffff);
+    const nvn_rbind *binding = NULL;
+    for (int i = 0; i < cs->rf.nb; i++) {
+        const nvn_rbind *b = &cs->rf.b[i];
+        if (b->kind == NVN_RB_IMG && b->reg == slot && b->rw) {
+            binding = b;
+            break;
+        }
+    }
+    if (!binding || !tid) return nil;
+    os_unfair_lock_lock(&g_rmu);
+    id<MTLTexture> result = nil;
+    if (tid < g_ntreg && g_treg[tid].ok) {
+        int real = 0;
+        uint64_t rid = 0;
+        result = img_binding(tid, binding, &rid, &real);
+        if (!real) result = nil;
+        if (result && desc) *desc = g_treg[tid].t;
+    }
+    os_unfair_lock_unlock(&g_rmu);
+    if (result.textureType != MTLTextureType2D || result.pixelFormat != MTLPixelFormatRGBA8Unorm || result.sampleCount != 1) return nil;
+    return result;
+}
 static void dispatch(const p_dispatch *dp) {
     zskip_clear();
     g_wr_epoch++; g_mdx_epoch++;
@@ -12468,7 +12509,8 @@ static void dispatch(const p_dispatch *dp) {
     void *ib = NULL; uint64_t io = 0, ig = 0;
     if (dp->ind && !mtl_gpu_addr(dp->ind, 12, &ib, &io, &ig)) { RED_ONCE(94, "indirect dispatch skipped: argument address %#llx is in no memory pool", (unsigned long long)dp->ind); return; }
     if (dp->ind) { static int once; if (!once++) MLOG("indirect dispatch: first time (the GPU reads the threadgroup counts from %#llx)", (unsigned long long)dp->ind); }
-    NvShader *cs = prog_get(S.cprog)->sh[5];
+    NvProg *program = prog_get(S.cprog);
+    NvShader *cs = program->sh[5];
     if (!cs) { RED_ONCE(28, "the dispatched program has no compute shader (or it is not mapped)"); return; }
     // Diagnostic DM_NVN_SKIP_CS=<key>[,<key>...] or =<file of keys, one a line> (none by default): drops every dispatch of these compute shaders (the picture will be wrong; for finding which compute work a symptom comes from)
     { static uint64_t *sk; static size_t nsk = (size_t)-1;
@@ -12480,6 +12522,13 @@ static void dispatch(const p_dispatch *dp) {
           free(txt);
           if (nsk) MLOG("DM_NVN_SKIP_CS: dropping the dispatches of %zu compute shaders (diagnostic; the picture is wrong)", nsk); }
       if (nsk && cs->key[0]) { uint64_t v = strtoull(cs->key, NULL, 16); for (size_t i = 0; i < nsk; i++) if (sk[i] == v) { static uint64_t nd; if (!nd++) MLOG("DM_NVN_SKIP_CS: first dispatch dropped: %s", cs->key); return; } } }
+    int ndve = !dp->ind && dp->x && dp->y && dp->z == 1 ? ndve_direct_role(cs) : 0;
+    if (ndve == 1) g_ndve_decoded = nil;
+    if (ndve == 2 && g_ndve_decoded) {
+        rp_flush();
+        image_prepare(program, 0x20);
+        if (ndve_direct_draw(cs)) return;
+    }
     const void *k = (__bridge const void *)cs;
     id<MTLComputePipelineState> ps = hm_get_id(&g_cps, &k);
     if (!ps) {
@@ -12564,6 +12613,7 @@ static void dispatch(const p_dispatch *dp) {
         gpcs_stamp(ce, 0, cs->key, 0); enc_c_dispatch_indirect(ce, ig, MTLSizeMake(tg[0], tg[1], tg[2])); gpcs_stamp(ce, 1, NULL, 0);
     } else { gpcs_stamp(ce, 0, cs->key, (uint32_t)dp->x * dp->y * dp->z); enc_c_dispatch(ce, MTLSizeMake(dp->x, dp->y, dp->z), MTLSizeMake(tg[0], tg[1], tg[2])); gpcs_stamp(ce, 1, NULL, 0); }
     if (own) enc_c_end(ce);
+    if (ndve == 1) g_ndve_decoded = ndve_image(cs, 0, NULL);
 }
 // GPU: texture -> buffer (row stride taken from SetCopyRowStride, layer stride from SetCopyImageStride, 0 = tightly packed)
 // A copy at a level the host texture lacks (more levels declared than its size holds, tex_desc) is skipped: Metal does not check the level of a blit
@@ -12886,6 +12936,24 @@ static int copy_t2t_draw(id<MTLTexture> s, id<MTLTexture> d, unsigned sl, unsign
     args_dirty_all(); g_pso_dirty = g_dss_dirty = 1;
     { static int once[2]; if (!once[depth]++) MLOG("format-converting / scaling texture copy: first case %dx%d format %lu → %dx%d format %lu%s%s", sr->width, sr->height, (unsigned long)s.pixelFormat, dr->width, dr->height, (unsigned long)d.pixelFormat,
                                                     linear && !depth ? " (bilinear)" : "", stencil ? (scopy ? " (depth + stencil)" : " (no stencil view possible, cleared to 0)") : ""); }
+    return 1;
+}
+static int ndve_direct_draw(NvShader *cs) {
+    id<MTLTexture> in = g_ndve_decoded;
+    g_ndve_decoded = nil;
+    tex_t desc = {0};
+    id<MTLTexture> out = ndve_image(cs, 1, &desc);
+    if (in.width != 1920 || in.height != 1080 || out.width != 2560 || out.height != 1440 ||
+        !(out.usage & MTLTextureUsageRenderTarget)) return 0;
+    zskip_del(desc.serial);
+    sparse_gpu_wrote(&desc);
+    rp_end();
+    if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    ubd_land_compute();
+    const NVNcopyRegion src = {0, 0, 0, 1920, 1080, 1}, dst = {0, 0, 0, 2560, 1440, 1};
+    if (!copy_t2t_draw(in, out, 0, 0, 0, 0, &src, &dst, 1, 0)) return 0;
+    static int once;
+    if (!once++) MLOG("NDVE movie: scaling the decoded RGBA frame directly from 1920x1080 to 2560x1440");
     return 1;
 }
 // nvnCommandBufferDrawTexture: the source region of a texture (texels, through the handle's sampler) drawn into the destination region of each bound colour target (pixels in the window's
