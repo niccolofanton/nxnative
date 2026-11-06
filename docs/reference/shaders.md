@@ -1092,6 +1092,14 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** [Splatoon Raiders](../../dm/games/0400380020056000/README.md): 26 such loops around the whole program in its uber shaders: the mid-size shader went from 176 loops to 0, the largest from 364 to 5, and 8 workers stalled for 5 h 40 before that. Three test shaders then compile in 89 s.
 - **Check:** `DMSH_TEST_XLATE=<translator> python3 dm/gfx/tests/test_dmsh_control_flow.py`.
 
+### Dual predicate outputs read their original inputs
+
+- **Symptom:** a translated ISETP or FSETP produces a false second predicate where the instruction requires true, when its first output aliases its positive accumulator predicate. Uniform UISETP and extended comparisons have the same failure.
+- **Cause:** `AIsetp` and `AFsetp` wrote the first output before building the second expression. `APred` supplies a register operand, so the second expression could read the new value. For example, `ISETP.NE.AND P0,P1,RZ,RZ,P0` with P0 initially true must produce `(false, true)`, but produced `(false, false)`.
+- **Fix:** compute both output expressions before writing either predicate. This preserves simultaneous instruction semantics for ordinary, extended and uniform comparisons, without a game-specific rule.
+- **Check:** `test_dmsh_ampere_alu.PredicateAlias`: 80 synthetic cases covering ISETP, ISETP.EX, UISETP, UISETP.EX and FSETP, AND/OR/XOR, positive/negated accumulators and alias/non-alias controls. The original bundled translator fails 12 of the first 64 cases; the source fix passes. Generated Metal shows the incorrect constant branch, without requiring GPU execution.
+- **Found on:** the [Ocarina of Time integration](../../dm/games/0400486024DEC000/README.md), through review of [Lichii's predicate lowering](https://github.com/zortos293/Lichii/commit/c9ebb5c3af67). This is a synthetic translator finding; use of the failing encoding in the game's active shaders and its visual impact remain open.
+
 ### Ampere carries, PLOP3's second result, POPC / FLO immediates, LEA.SX32 and LEA's negated B
 
 - **Symptom:** none met in a game yet: found by differential testing (single instructions with nvdisasm-checked encodings, run on an Apple GPU and compared with an interpreter on Mesa NAK's hardware-checked folds). A 64-bit three-operand add off by 2^32, `POPC R, 0x800000ff` giving 23, a predicate pair from `PLOP3` that reads its own first result, a negative 32-bit index added to a 64-bit address as if positive.

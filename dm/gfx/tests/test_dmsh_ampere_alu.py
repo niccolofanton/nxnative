@@ -190,6 +190,61 @@ class Vote(Alu):
     def test_vote_writes_the_lane_predicate(self):
         self.assertIn('simd_any', self.kept(self.FSETP, self.VOTE, self.MOV_P0, srcs=(6, 19, 20)))
 
+class PredicateAlias(Alu):
+    """Dual predicate outputs must both read their inputs before either destination is written. The second output of an ISETP/FSETP whose first output
+    aliases its positive accumulator used the new accumulator instead. These constant cases keep that output through a guarded move and a shared store."""
+    CTRL = 0x000fe20000000000 << 64
+
+    @staticmethod
+    def words(value): return value >> 64, value & ((1 << 64) - 1)
+
+    def compare(self, comparison, dest0, dest1=7, pred=7, *, bop=0, negate=False, ex=False, uniform=False, floating=False):
+        zero = 63 if uniform else 255
+        opcode = 0x28c if uniform else 0x20b if floating else 0x20c
+        value = (self.CTRL | opcode | (7 << 12) | (zero << 24) | (zero << 32) | (comparison << 76)
+                 | (dest0 << 81) | (dest1 << 84) | (pred << 87) | (bop << 74) | (int(negate) << 90))
+        if ex: value |= (1 << 72) | (2 << 68)
+        return self.words(value)
+
+    def move(self, rd, value, pred=7):
+        return self.words(self.CTRL | 0x802 | (pred << 12) | (rd << 16) | (value << 32))
+
+    def check_outputs(self, *, ex=False, uniform=False, floating=False):
+        # False AND true and true OR false change the first output's aliased input. XOR also catches a flipped source; negated inputs and non-aliasing outputs are controls.
+        for bop, comparison in ((0, False), (1, True), (2, False), (2, True)):
+            for negate in (False, True):
+                for alias in (False, True):
+                    with self.subTest(bop=bop, comparison=comparison, negate=negate, alias=alias):
+                        initial = bop != 1
+                        accumulator = initial != negate
+                        expected = ((not comparison) and accumulator if bop == 0 else
+                                    (not comparison) or accumulator if bop == 1 else (not comparison) != accumulator)
+                        pre = [self.move(6, 0), self.compare(2 if initial else 5, 0, uniform=uniform)]
+                        if ex: pre.append(self.compare(2 if comparison else 5, 2, uniform=uniform))
+                        test = self.compare(2 if ex or comparison else 5, 0 if alias else 3, 1, 0,
+                                            bop=bop, negate=negate, ex=ex, uniform=uniform, floating=floating)
+                        if uniform:
+                            # @UP1 UMOV UR4,1; MOV R6,UR4. The zero keeps the other branch defined.
+                            used = [(0x000fe20000000000, 0x0000003f00047c82), (0x000fe20000000000, 0x0000000100041882),
+                                    (0x000fe20000000f00, 0x0000000400067c02)]
+                        else:
+                            used = [self.move(6, 1, pred=1)]
+                        # The common STORE is guarded by !P0; make it unconditional so only the second predicate determines the result.
+                        store = STORE[0], STORE[1] & ~0xf000 | 0x7000
+                        code = [s2r_tid(9), *pre, test, *used, store, EXIT]
+                        msl = self.translate(b''.join(inst(*waiting(c)) for c in code), shared=0x1000)
+                        self.assertIn(f'if ({str(expected).lower()})', msl)
+
+    def test_isetp_reads_both_inputs_before_writing(self): self.check_outputs()
+
+    def test_isetp_ex_reads_both_inputs_before_writing(self): self.check_outputs(ex=True)
+
+    def test_uisetp_reads_both_inputs_before_writing(self): self.check_outputs(uniform=True)
+
+    def test_uisetp_ex_reads_both_inputs_before_writing(self): self.check_outputs(ex=True, uniform=True)
+
+    def test_fsetp_reads_both_inputs_before_writing(self): self.check_outputs(floating=True)
+
 
 if __name__ == '__main__':
     unittest.main()

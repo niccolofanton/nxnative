@@ -205,8 +205,11 @@ namespace Ryujinx.Graphics.Shader.Instructions
             Operand p = APred(context, x, 87, 90);
             BoolOp bop = (BoolOp)x.Bits(74, 76);
 
-            ASetPred(context, x.Bits(81, 84), GetPredLogicalOp(context, bop, cmp, p));
-            ASetPred(context, x.Bits(84, 87), GetPredLogicalOp(context, bop, context.BitwiseNot(cmp), p));
+            // Both outputs read the input predicates as they were before this instruction, even when the first output aliases p.
+            Operand res0 = GetPredLogicalOp(context, bop, cmp, p);
+            Operand res1 = GetPredLogicalOp(context, bop, context.BitwiseNot(cmp), p);
+            ASetPred(context, x.Bits(81, 84), res0);
+            ASetPred(context, x.Bits(84, 87), res1);
         }
 
         public static void AFsel(EmitterContext context)
@@ -810,8 +813,11 @@ namespace Ryujinx.Graphics.Shader.Instructions
             Operand p = APred(context, x, 87, 90, u);
             BoolOp bop = (BoolOp)x.Bits(74, 76);
 
-            ASetPred(context, x.Bits(81, 84), GetPredLogicalOp(context, bop, cmp, p), u);
-            ASetPred(context, x.Bits(84, 87), GetPredLogicalOp(context, bop, context.BitwiseNot(cmp), p), u);
+            // ISETP, UISETP and their .EX forms read both predicate results before writing either destination.
+            Operand res0 = GetPredLogicalOp(context, bop, cmp, p);
+            Operand res1 = GetPredLogicalOp(context, bop, context.BitwiseNot(cmp), p);
+            ASetPred(context, x.Bits(81, 84), res0, u);
+            ASetPred(context, x.Bits(84, 87), res1, u);
         }
 
         // 0x80d: what the compiler puts at the end of a vertex shader's position in Kirby Air Riders (all 6,319 of them, no other game's), its meaning inferred from what surrounds it. Before it, FSETP sets P0..P5 where x, y or z lies
