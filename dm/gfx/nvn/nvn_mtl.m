@@ -9116,7 +9116,7 @@ static uint64_t g_geo_bind[5];
 // `key failed/ran`: in how many failed command buffers, of how many that encoded it. A shader that runs everywhere has a low ratio. Counts rather than an intersection: one failure with another
 // cause would empty an intersection for good. A victim of another's fault and a submission refused after one ran nothing of their own and do not count. The list leaves out the host's own passes
 // and the kernels of geometry emulation, so a fault there shows no shader standing out. Only the submit thread adds to the list; the feedback handlers print, under g_cbs_mu
-enum { CBS_KEY = sizeof ((NvShader *)0)->key, CBS_SHOW = 200, CBS_RANK = 30, CBS_REPORTS = 16 };
+enum { CBS_KEY = sizeof ((NvShader *)0)->key, CBS_SHOW = 1000, CBS_RANK = 60, CBS_REPORTS = 16 };
 typedef struct { char key[CBS_KEY]; uint32_t runs; } cbs_ent;   // runs: command buffers that had encoded it, this one included
 struct cbs_list { uint32_t n; cbs_ent e[]; };
 typedef struct { char key[CBS_KEY]; uint32_t failed, runs; } cbs_tally_ent;
