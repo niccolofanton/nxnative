@@ -57,6 +57,7 @@ On an Apple7-family GPU (M1, M1 Pro / Max / Ultra) the host applies a preset bef
 - `DM_NVN_NDVE_MOVIE_DIRECT=2`: title and movie frames 52 → 16.7 ms.
 - `DM_NVN_PROBE_EVERY=4`: about 5-6 ms less GPU time a frame; also avoids a GPU page fault after Continue.
 - `DM_NVN_CS_DEPS=1`: about 4 ms less.
+- `DM_NVN_GPU_TS_SCALE=0.6`: the dynamic resolution goes from its 683x384 floor to its 1536x864 maximum in Link's house for 5 ms more a frame (p50 23.8 → 28.5 ms, 42 → 35 FPS, no frame over 33 ms); in Kokiri it stays at the floor and costs nothing (about 39.5 ms either way).
 - `DM_UPSCALER=metalfx` (NDSR network off) is in the table but disabled until the MetalFX colour fix is verified.
 
 ## Memory
