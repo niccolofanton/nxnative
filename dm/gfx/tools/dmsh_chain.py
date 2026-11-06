@@ -41,11 +41,26 @@ def f32_atomic():
     return v
 
 def loop_cap():
-    """The most times one entry into a loop runs its body (DMSH_LOOP_CAP, default 65536, 0 = no limit): a loop whose bound comes from memory that holds garbage then exits early
-    and shades a pixel wrong instead of hanging the GPU (Ocarina of Time's light-list loops in Kokiri). Part of the options, so each value has its own V and shader cache keys"""
-    v = os.environ.get('DMSH_LOOP_CAP', '65536')
+    """The most times one entry into a loop runs its body (DMSH_LOOP_CAP, default 0 = no limit): a loop whose bound comes from memory that holds garbage then exits early
+    and shades a pixel wrong instead of hanging the GPU. A global cap of 65536 cut Ocarina of Time's house ceiling (a legitimately long loop) and did not stop its hangs, so it is off;
+    the per-shader caps below take its place. Part of the options, so each value has its own V and shader cache keys"""
+    v = os.environ.get('DMSH_LOOP_CAP', '0')
     if not v.isdigit() or int(v) >= 1 << 32: sys.exit(f'[RED] DMSH_LOOP_CAP={v}: expected an iteration count below 2^32 (0 = no limit)')
     return int(v)
+
+# agl's task shaders 99280b7b8aae78df / 47f9b38490dcf9a2 (Ocarina of Time) loop (min(end - start, 256) - 1) >> 5 times, unsigned: a group dispatched on an empty bucket
+# (end == start) loops 2^27 - 1 times and hangs the GPU; valid data never needs more than 8 passes (256 / 32). DMSH_LOOP_CAP_KEYS=<key>:<cap>[,...] (default these two at 64, 8x the valid maximum, in case of inner loops; "" = none)
+LOOP_CAP_KEYS_DEFAULT = '47f9b38490dcf9a2:64,99280b7b8aae78df:64'
+def loop_cap_keys():
+    v = os.environ.get('DMSH_LOOP_CAP_KEYS', LOOP_CAP_KEYS_DEFAULT); out = {}
+    for item in filter(None, v.split(',')):
+        k, _, c = item.partition(':')
+        if len(k) != 16 or not c.isdigit(): sys.exit(f'[RED] DMSH_LOOP_CAP_KEYS item {item!r}: expected <16-hex-digit key>:<cap>')
+        out[k] = int(c)
+    return out
+
+def loop_cap_for(key):
+    return loop_cap_keys().get(key[:16], loop_cap())
 
 def mesh_trim():
     """Whether a mesh shader hands Metal only the outputs its paired pixel shaders read (mesh_pairs.tsv; dmsh_meshstage.py widths): on by default, DMSH_MESH_TRIM=0 keeps every output a float4
@@ -55,7 +70,7 @@ def mesh_trim():
     return v == '1'
 
 def options():
-    return 'debug=%s reduced=%s f32_atomic=%s loop_cap=%d mesh_trim=%s' % (os.environ.get('XLATE_DEBUG', '1') != '0', os.environ.get('XLATE_REDUCED', '1') == '1', f32_atomic(), loop_cap(), mesh_trim())
+    return 'debug=%s reduced=%s f32_atomic=%s loop_cap=%d loop_cap_keys=%s mesh_trim=%s' % (os.environ.get('XLATE_DEBUG', '1') != '0', os.environ.get('XLATE_REDUCED', '1') == '1', f32_atomic(), loop_cap(), ','.join('%s:%d' % kv for kv in sorted(loop_cap_keys().items())), mesh_trim())
 
 def version():
     h = hashlib.sha256()
