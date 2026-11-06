@@ -264,12 +264,21 @@ namespace Ryujinx.Graphics.Shader.Instructions
             // nxnative: in a compute shader, one MatrixLoad a matrix (sources: shared memory id, mode, row address, matrix), which TensorPass lowers to the same per-lane code
             // (LdsmLane) once it knows whether the HMMAs it feeds read their A straight from where it reads (Ampere HMMA through simdgroup_matrix). One destination each:
             // the optimizer's dead code removal takes an operation whose destination nothing reads as dead, sources included
+            // nxnative: LDSM reads rows that other lanes of the warp stored (STS) just before, with no BAR between (the agl networks of Ocarina of Time's movie
+            // filter); the warp's shared memory accesses are in order on the Switch, while Metal orders another lane's threadgroup store and this load only through
+            // a barrier, and the compiler moved them past each other: every other pixel of a few rows wrong (the high halves). LDSM is warp-collective (the whole warp
+            // runs it), so a subgroup barrier before its loads and one after (no lane's next store over the rows before all have read them) is safe. In a compute
+            // shader the MatrixLoads stay between the two (TensorPass lowers them in place; a subgroup barrier is no shared write to its A-operand check)
+            context.SubgroupBarrier();
+
             for (int m = 0; m < count && x.Rd + m < RegisterConsts.RegisterZeroIndex; m++)
             {
                 Operand result = compute ? context.Add(Instruction.MatrixLoad, Local(), Const(id), Const(mode), addr, Const(m)) : LdsmLane(context, g, t, addr, id, m, mode);
 
                 context.Copy(Register(x.Rd + m, RegisterType.Gpr), result);
             }
+
+            context.SubgroupBarrier();
         }
 
         // LDSM per lane: lane L's register of matrix m (g = L / 4, t = L % 4), from the row addresses (bytes in shared memory `id`) the lanes hold in addr
