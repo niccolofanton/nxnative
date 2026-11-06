@@ -177,7 +177,53 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
 
         private static OperationResult GenerateAtomicAdd(CodeGenContext context, AstOperation operation)
         {
+            if ((operation.Inst & Instruction.FP32) != 0)
+            {
+                return GenerateAtomicAddF32(context, operation);
+            }
+
             return GenerateAtomicMemoryBinary(context, operation, context.Delegates.AtomicIAdd);
+        }
+
+        // nxnative: the float atomic add (InstEmitMemory.EmitAtomicAddF32, MetalFloatAtomics) as OpAtomicFAddEXT; the result is the old value's bits, as the IR's AtomicAdd has it.
+        // Raw global memory takes a float pointer of its own (a physical storage buffer pointer, valid SPIR-V that SPIRV-Cross writes as a device atomic_float). A storage buffer's words are
+        // uint and logical pointers cannot be cast, so the op takes the uint element pointer: SPIRV-Cross then writes an atomic_uint add of the value's bits into a float result, which
+        // dmsh_atomic.py (float_atomics) turns into the atomic_float add, and fails the shader on any form it does not know. dmsh_atomic.py also raises the MSL version of such modules (3.1)
+        private static OperationResult GenerateAtomicAddF32(CodeGenContext context, AstOperation operation)
+        {
+            if (!context.WasFloatAtomicAddDeclared)
+            {
+                context.AddCapability(Capability.AtomicFloat32AddEXT);
+                context.AddExtension("SPV_EXT_shader_atomic_float_add");
+                context.WasFloatAtomicAddDeclared = true;
+            }
+
+            SpvInstruction elemPointer;
+
+            if (operation.StorageKind == StorageKind.GlobalMemory)
+            {
+                SpvInstruction addressWords = context.CompositeConstruct(
+                    context.TypeVector(context.TypeU32(), 2),
+                    context.Get(AggregateType.U32, operation.GetSource(0)),
+                    context.Get(AggregateType.U32, operation.GetSource(1)));
+
+                elemPointer = context.ConvertUToPtr(
+                    context.TypePointer(StorageClass.PhysicalStorageBuffer, context.TypeFP32()),
+                    context.Bitcast(context.TypeInt(64, 0), addressWords));
+            }
+            else
+            {
+                elemPointer = GetStoragePointer(context, operation, out _);
+            }
+
+            SpvInstruction value = context.Get(AggregateType.FP32, operation.GetSource(operation.SourcesCount - 1));
+
+            SpvInstruction one = context.Constant(context.TypeU32(), 1);
+            SpvInstruction zero = context.Constant(context.TypeU32(), 0);
+
+            SpvInstruction old = context.AtomicFAddEXT(context.TypeFP32(), elemPointer, one, zero, value);
+
+            return new OperationResult(AggregateType.U32, context.Bitcast(context.TypeU32(), old));
         }
 
         private static OperationResult GenerateAtomicAnd(CodeGenContext context, AstOperation operation)

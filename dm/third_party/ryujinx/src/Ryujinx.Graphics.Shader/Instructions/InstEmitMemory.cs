@@ -206,6 +206,16 @@ namespace Ryujinx.Graphics.Shader.Instructions
         // its full correction, several times too bright. Returns the value before the add
         private static Operand EmitAtomicAddF32(EmitterContext context, StorageKind storageKind, Operand e0, Operand e1, Operand value)
         {
+            // nxnative: on Metal the add is one native atomic_float add (MetalFloatAtomics, the build's default; DMSH_F32_ATOMIC=cas keeps the loop below). Even with the atomic re-read,
+            // 21d9f83e6027c565 (agl's scene analysis: every SIMD-group of the dispatch adds into the same few words) still hung an M1 Pro once in 20 minutes: under that contention each CAS
+            // round lets one SIMD-group through and makes all the others retry, so the dispatch costs a round trip per contender per add. The native add is resolved in the memory system,
+            // one request per SIMD-group. Device memory only: threadgroup float atomics are not relied on, so shared memory keeps the loop. .FTZ: the input is flushed; a denormal sum
+            // is stored as is (the hardware's add, not Maxwell's), which only matters for sums below 2^-126
+            if (storageKind == StorageKind.GlobalMemory && context.TranslatorContext.Options.Flags.HasFlag(TranslationFlags.MetalFloatAtomics))
+            {
+                return context.AtomicAddF32(storageKind, e0, e1, FlushDenormal(context, value));
+            }
+
             Operand lblRetry = Label();
             context.MarkLabel(lblRetry);
 

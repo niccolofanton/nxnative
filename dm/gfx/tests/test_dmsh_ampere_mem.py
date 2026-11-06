@@ -296,6 +296,45 @@ def sts(offset, rb):   # STS.U32 [RZ + offset], Rb: keeps its result
     return inst(0x000fe80000000800, offset << 40 | rb << 32 | 0xff << 24 | 0x7388)
 
 
+class RedF32(Translated):
+    """RED.E.ADD.F32.FTZ.RN (0x98e, type 3 at 73..76), in Ocarina of Time's encoding (agl's sky_analyze 21d9f83e6027c565 at +0xa70, there on UR4 and R9). By default (MetalFloatAtomics) it
+    is one native atomic_float add: the translator writes OpAtomicFAddEXT on the storage buffer's uint word and dmsh_atomic.check_msl makes SPIRV-Cross's atomic_uint form the float add.
+    The translator used to log `Invalid reduction type: F32FtzRn` and drop the instruction"""
+    ULDC = (0x000fe40000000a00, 0x0000100000067ab9)   # ULDC.64 UR6, c[0][0x40]: storage slot 0 with the c0 layout below (3 uniform buffers, 1 storage buffer)
+    RED = (0x000fe8000c10e706, 0x00000005ff00798e)    # RED.E.ADD.F32.FTZ.RN [UR6], R5: at the start of storage slot 0
+    OPTIONS = {}
+
+    def msl(self, red=None):
+        code = mov(5, 0x3fc00000) + inst(*self.ULDC) + inst(*(red or self.RED)) + inst(*EXIT)
+        sys.path.insert(0, str(TOOLS)); import dmsh_atomic
+        return dmsh_atomic.check_msl(self.translate(code, nvn2_cs=[3, 1, 0, 0x50, 0], **self.OPTIONS))
+
+    def test_the_add_is_native(self):
+        msl = self.msl()
+        self.assertRegex(msl, r'atomic_fetch_add_explicit\(\(device atomic_float\*\)&\(\*spvDescriptorSet0\.cp_s0\)\._m0\[0\], ')
+        self.assertNotIn('atomic_compare_exchange', msl)
+        self.assertIn('1.5', msl)   # the value, as a float operand of the add
+
+
+class RedF32Cas(RedF32):
+    """The same with DMSH_F32_ATOMIC=cas (job f32_atomic): the add retries a compare-and-swap of the word, which it reads atomically on every retry"""
+    OPTIONS = {'f32_atomic': 'cas'}
+
+    def test_the_add_is_native(self):
+        self.assertNotIn('atomic_float', self.msl())
+
+    def test_the_add_is_kept(self):
+        msl = self.msl()
+        self.assertRegex(msl, r'atomic_compare_exchange_weak_explicit\(\(device atomic_uint\*\)&\(\*spvDescriptorSet0\.cp_s0\)\._m0\[0\]')
+        self.assertIn('1.5', msl)
+
+    def test_it_retries_until_the_word_held_what_it_read(self):
+        self.assertRegex(self.msl(), r'\bdo\s*\{[^}]*\}\s*while|for \(;;\)|while \(')
+
+    def test_the_sum_flushes_denormals(self):
+        self.assertIn('1.1754943508222875', self.msl())
+
+
 class Shared(Translated):
     """Fire Emblem Fortune's Weave's Lighting compute shaders: the exposure histogram and its 64-bit average, in the game's own encodings"""
     STS_SCALED_4 = 0x000fe80000004800, 0x0000000302027388   # STS.U32 [R2 * 4], R3 (6d0f6db3f0d396a3 +0x80 with a value): R2 counts words. Read unscaled, bin b came back at about 4b

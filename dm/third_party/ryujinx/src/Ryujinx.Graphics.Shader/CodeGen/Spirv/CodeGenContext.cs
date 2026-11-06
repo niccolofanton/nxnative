@@ -83,6 +83,8 @@ namespace Ryujinx.Graphics.Shader.CodeGen.Spirv
         public bool IsMainFunction { get; private set; }
         public bool MayHaveReturned { get; set; }
         public bool WasNonUniformAccessDeclared { get; set; }
+        // nxnative: the module already declares the float atomic add capability and extension (Instructions.GenerateAtomicAddF32)
+        public bool WasFloatAtomicAddDeclared { get; set; }
 
         public CodeGenContext(
             StructuredProgramInfo info,

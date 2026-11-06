@@ -15,5 +15,7 @@ namespace Ryujinx.Graphics.Shader.Translation
         // Ampere (sm_86) machine code, as NVN2 (Switch 2) ships it: a 0x80-byte shader header (SPH version 4, its first 0x50 bytes laid out as version 3)
         // and 128-bit instructions, decoded and emitted by the Ampere frontend.
         Ampere = 1 << 4,
+        // Offline Metal: a float atomic add on global memory (RED / ATOMG .ADD.F32) is one native atomic_float add (OpAtomicFAddEXT, MSL 3.0+, Apple7 and later), not a compare-and-swap loop.
+        MetalFloatAtomics = 1 << 5,
     }
 }

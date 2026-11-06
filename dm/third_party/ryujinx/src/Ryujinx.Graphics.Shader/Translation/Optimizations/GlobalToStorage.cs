@@ -1025,7 +1025,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
         private static string GetFunctionName(Operation baseOp, bool isMultiTarget, IReadOnlyList<uint> targetCbs)
         {
             StringBuilder nameBuilder = new();
-            nameBuilder.Append(baseOp.Inst.ToString());
+            // nxnative: the instruction without its flags, which ToString would join with ", " (Instruction is a [Flags] enum); the float add is AtomicAddF32
+            nameBuilder.Append((baseOp.Inst & Instruction.Mask).ToString());
+            nameBuilder.Append((baseOp.Inst & Instruction.FP32) != 0 ? "F32" : string.Empty);
 
             nameBuilder.Append(baseOp.StorageKind switch
             {
@@ -1084,6 +1086,9 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 {
                     case Instruction.AtomicAdd:
                         resultValue = context.AtomicAdd(StorageKind.StorageBuffer, binding, Const(0), wordOffset, value);
+                        break;
+                    case Instruction.AtomicAdd | Instruction.FP32:   // nxnative: the native float add (InstEmitMemory.EmitAtomicAddF32)
+                        resultValue = context.AtomicAddF32(StorageKind.StorageBuffer, binding, Const(0), wordOffset, value);
                         break;
                     case Instruction.AtomicAnd:
                         resultValue = context.AtomicAnd(StorageKind.StorageBuffer, binding, Const(0), wordOffset, value);

@@ -12,6 +12,17 @@ namespace Ryujinx.Graphics.Shader.Translation
             return context.Add(Instruction.AtomicAdd, storageKind, Local(), a, b, c);
         }
 
+        // nxnative: a float atomic add, the old value's bits as the result (MetalFloatAtomics). The FP32 flag marks it: everything that asks IsAtomic() or masks the instruction treats it as AtomicAdd
+        public static Operand AtomicAddF32(this EmitterContext context, StorageKind storageKind, Operand a, Operand b, Operand c)
+        {
+            return context.Add(Instruction.AtomicAdd | Instruction.FP32, storageKind, Local(), a, b, c);
+        }
+
+        public static Operand AtomicAddF32(this EmitterContext context, StorageKind storageKind, int binding, Operand e0, Operand e1, Operand value)
+        {
+            return context.Add(Instruction.AtomicAdd | Instruction.FP32, storageKind, Local(), Const(binding), e0, e1, value);
+        }
+
         public static Operand AtomicAnd(this EmitterContext context, StorageKind storageKind, Operand a, Operand b, Operand c)
         {
             return context.Add(Instruction.AtomicAnd, storageKind, Local(), a, b, c);
