@@ -47,3 +47,6 @@ tex_dirty_upload	on
 # The game's compute dispatches with no barrier of its between them run side by side (nvn_mtl.m dispatch_enc): 117 at the start of a frame in Kokiri Forest waited each for the one
 # before, 5.7 ms; side by side 3.7 ms, the frame 27.1 -> 24.9 ms (docked, Apple M4 Pro), the picture within run-to-run noise (from the Mighty Green Kokiri Kid fork, 5208584a)
 dispatch_overlap	on
+# Frame rate: the host steps the game in whole vsyncs (patches.py frame_step: the frame-rate controller's interval and fps follow the host's step), so the launcher's Frame rate
+# setting offers 30 and 60. At 30 every frame is held two vsyncs (33.3 ms) and the game's own 30 fps mode steps its time by two, so it runs at full speed (kid-with-sword fork, 2de238f3)
+fps_target	60

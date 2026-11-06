@@ -64,7 +64,7 @@ def run(constant, target, seconds):
 @unittest.skipIf(unicorn is None, 'optional ARM64 execution dependency: unicorn')
 class RealSpeed(unittest.TestCase):
     def test_registered_build(self):
-        self.assertEqual(profile.FRAME_STEP, {'e0f3ccfaf50065ae4ea01eb5aeb13b1a': profile.real_speed})
+        self.assertEqual(profile.FRAME_STEP, {'e0f3ccfaf50065ae4ea01eb5aeb13b1a': profile.frame_step_real_speed})
 
     def test_no_measurement_keeps_the_games_step(self):
         step, mark, ctx, pc = run(60.0, 60.0, 0.0)
