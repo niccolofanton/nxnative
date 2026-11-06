@@ -1616,11 +1616,20 @@ static uint64_t gpu_s_guest_ns(double s) {   // a feedback GPU time (seconds on 
     if (s <= 0 || !g || at > now || now - at > g) return 0;
     return g - (now - at);
 }
+// DM_NVN_GPU_TS_SCALE=<f> (default 1; read again every 1,024 reports, so DM_CTL env can change it mid-run): GPU times the game measures inside a command buffer are scaled by f,
+// reported as c0 + (t - c0) * f from the buffer's GPU start. Ocarina's dynamic resolution sizes its 3D view from these times: on an M1 Pro it sits at its floor (683x384 of 2048x1152);
+// f < 1 makes it pick a larger view at a lower frame rate (a quality knob between the floor and DM_NVN_GPU_TS=submission's fixed maximum), f > 1 the reverse. Times stay monotonic (never later than the real ones)
+static uint64_t ts_scale(uint64_t ns, uint64_t c0) {
+    static double f = -1; static unsigned n;
+    if (f < 0 || !(n++ & 1023)) { const char *e = getenv("DM_NVN_GPU_TS_SCALE"); double v = e ? atof(e) : 1; f = v > 0.05 && v < 20 ? v : 1; }
+    if (f == 1 || !c0 || ns <= c0) return ns;
+    return c0 + (uint64_t)((double)(ns - c0) * f);
+}
 static uint64_t rep_ticks(const post_op *o, seg_clk *sc, uint32_t last, uint64_t c0, uint64_t c1) {   // the time a counter report records (614.4 MHz); c0 / c1: the last segment's GPU start / end on the guest clock
     int top = o->type == 0x10; uint64_t ns = 0;
     if (sc && o->seg < last && o->seg < SEG_CLK_N) ns = atomic_load(&sc->t[o->seg][!top]);
     if (!ns) ns = top ? c0 : c1;
-    return ns ? nvn_timestamp_from_ns(ns) : gpu_ticks();
+    return ns ? nvn_timestamp_from_ns(ts_scale(ns, c0)) : gpu_ticks();
 }
 
 // ---------- Boot instrumentation (DM_BOOTPROF=1): metallib loading, pipeline creation (both happen synchronously during replay on the submit thread), texture upload, first-frame present ----------
