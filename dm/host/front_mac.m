@@ -475,7 +475,7 @@ static const struct { const char *name, *value; int on; } k_preset_m1[] = {
     {"DM_NVN_NDVE_MOVIE_DIRECT", "2", 1},   // NDVE movie network skipped: title / movie 52 -> 16.7 ms a frame
     {"DM_NVN_PROBE_EVERY", "4", 1},         // a reflection probe face drawn every 4th visit: -5-6 ms GPU; also avoids a GPU page fault after Continue
     {"DM_NVN_CS_DEPS", "1", 1},             // compute barriers only where ranges overlap: about -4 ms
-    {"DM_UPSCALER", "metalfx", 0},          // NDSR network off. TODO: enable after the MetalFX colour fix is verified
+    {"DM_UPSCALER", "metalfx", 1},          // NDSR network off: PR #1456 HMMA chains streak on M1; MetalFX (gamma-2 fix 7a951791) matches its tone, same GPU cost
 };
 // DM_PRESET=auto (default): this game on an Apple7-family GPU; m1: this game on any GPU; off: nothing. Runs before main, after front_hud_env (the GPU query makes the
 // process's first Metal device, which reads MTL_HUD_ENABLED)
