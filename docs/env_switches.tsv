@@ -232,6 +232,7 @@ DM_NVN_VBUF_CACHE	switch	`0` turns off the cache of resolved vertex stream addre
 DM_NVN_VCONV_CHECK	diagnostic	`=1` scans the indices again at every reuse of a cached vertex conversion range (`vconv_range`) and reports differences
 DM_NVN_VCONV_CPU	switch	`=1` converts integer vertex inputs fed formats of another class on the CPU, as before, instead of through the shader's shadow inputs (`<key>_bv`)
 DM_NVN_VCONV_RANGE	switch	`0` / `1` overrides the profile's `vconv_range`: CPU vertex conversion only over the vertices each draw reads instead of the whole bound range
+DM_NVN_VIS_CARRY	switch	`=1`: when the occlusion ring (`g_vis_ring`) hands a visibility buffer to a new submission, the samples-passed slots still counted since the last reset that sit in it are summed on the CPU and carried, and a report keeps the buffers its slots are in from reuse until its submission completes. Off (default): a reset-to-report window longer than the ring, or a game counting without resets, sums slots a later submission overwrote, and the slot list grows without bound
 DM_NVN_VLOG	diagnostic	Set: logs each NVN memory pool as it is created (address, memory, size, flags) with a backtrace
 DM_NVN_VSDUMP	path	Output file for post-vertex captures; used with DM_NVN_VSDUMP_KEY and the frame/count bounds
 DM_NVN_VSDUMP_FROM	diagnostic	First presented frame eligible for a post-vertex capture (default 0)

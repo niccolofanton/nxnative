@@ -888,8 +888,8 @@ static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at encode time
 // Metal: every render pass attaches a visibility result buffer; draws during counting use counting mode, with a new slot per pass (no reliance on accumulation across passes); a reset empties the 'slot table since the reset',
 // and a report hands the slot table together with its buffer (retained) to the completion callback to sum and write back; after a report a new slot is used, so later draws are not counted into the reported value.
 // (Previously always wrote 0: occlusion query = 'fully occluded', campfires / light sources got culled - the character select screen calls ResetCounter 21 times per frame)
-typedef struct { void *buf; uint32_t slot; } vis_slot;
-typedef struct { int n; vis_slot s[]; } vis_list;
+typedef struct { void *buf; uint32_t slot; int ring; } vis_slot;   // ring: index in g_vis_ring, -1 for an overflow buffer
+typedef struct { int n; uint64_t carry; vis_slot s[]; } vis_list;   // carry: samples of slots folded before their buffer was reused (vis_carry_on)
 #define VIS_SLOTS 8192
 typedef struct { __strong id<MTLBuffer> buf; uint64_t fence; } vis_buf;
 // One visibility buffer per submission in flight, as many as command allocators: with 4, Age of Calamity (about twelve submissions a frame) waited in mtl_sub_begin for the previous frame's GPU work; its first battle went from 18.0 to 16.9 ms a frame on the Mac
@@ -899,11 +899,25 @@ static id<MTLBuffer> g_vis; static uint32_t g_vis_n;   // This submission's visi
 static int vis_in_ring(id<MTLBuffer> b) { for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].buf == b) return 1; return 0; }
 static int g_vis_on, g_vis_counting, g_vis_cur = -1; static uint64_t g_vis_cur_pass;
 static vis_slot *g_vs; static int g_nvs, g_vscap;      // Slots since the last reset
+// The counter lives from a reset to the next, across submissions and segments (nothing here resets it at a submission; Lichii 5b89a3da fixed that bug in its Vulkan backend). But a slot
+// lives in a ring buffer the ring hands to a later submission once its own has completed, which then writes over it from slot 0: a reset-to-report window longer than the ring (or a game
+// that counts without resetting, as Ocarina of Time's title screen does in Lichii's notes) summed slots a later submission had overwritten, and the slot list grew without bound.
+// DM_NVN_VIS_CARRY=1: when the ring reuses a buffer, the list's slots in it (complete by then) are summed on the CPU into g_vis_carry and dropped, and a report keeps the buffers its slots
+// are in from reuse until its own submission has completed. Off by default (unchecked on the GPU)
+static uint64_t g_vis_carry;
+static int vis_carry_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_VIS_CARRY"); v = e && atoi(e) > 0; if (v) MLOG("DM_NVN_VIS_CARRY=1: occlusion slots in a reused ring buffer are carried on the CPU"); } return v; }
+static void vis_fold(int ring) {   // submit thread, before the ring hands out buffer `ring` again: its last submission has completed
+    if (!vis_carry_on() || !g_nvs) return;
+    const uint64_t *c = (const uint64_t *)g_vis_ring[ring].buf.contents; int k = 0;
+    for (int i = 0; i < g_nvs; i++) { if (g_vs[i].ring == ring) { g_vis_carry += c[g_vs[i].slot]; CFRelease(g_vs[i].buf); } else g_vs[k++] = g_vs[i]; }
+    g_nvs = k;
+}
 static uint64_t g_cnt_report[32], g_cnt_reset[32];       // Report / reset counts per counter type (diagnostics)
-static void vis_clear(void) { for (int i = 0; i < g_nvs; i++) CFRelease(g_vs[i].buf); g_nvs = 0; g_vis_cur = -1; }
+static void vis_clear(void) { for (int i = 0; i < g_nvs; i++) CFRelease(g_vs[i].buf); g_nvs = 0; g_vis_cur = -1; g_vis_carry = 0; }
 static vis_list *vis_snapshot(void) {
-    vis_list *l = malloc(sizeof *l + g_nvs * sizeof(vis_slot)); l->n = g_nvs;
-    for (int i = 0; i < g_nvs; i++) { l->s[i] = g_vs[i]; CFRetain(g_vs[i].buf); }
+    vis_list *l = malloc(sizeof *l + g_nvs * sizeof(vis_slot)); l->n = g_nvs; l->carry = g_vis_carry;
+    for (int i = 0; i < g_nvs; i++) { l->s[i] = g_vs[i]; CFRetain(g_vs[i].buf);
+        int r = g_vs[i].ring; if (vis_carry_on() && r >= 0 && r != g_vis_ring_i && g_vis_ring[r].fence < g_fence + 1) g_vis_ring[r].fence = g_fence + 1; }   // summed when this submission completes (post_run, before g_done moves)
     return l;
 }
 // Target ranges of buffer writes (copies / inline uniform updates) already encoded in this submission but not yet executed on the GPU: reading these addresses on the CPU side at encode time yields old values (uv_proof avoids them when reading uniforms)
@@ -1076,6 +1090,7 @@ void mtl_sub_begin(void) {
     for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].fence <= g_done) { pick = i; break; }
     if (pick < 0 && g_vis_ring_n < g_alloc_cap) pick = g_vis_ring_n++;
     if (pick < 0) { uint64_t oldest = UINT64_MAX; for (int i = 0; i < g_vis_ring_n; i++) if (g_vis_ring[i].fence < oldest) { oldest = g_vis_ring[i].fence; pick = i; } if (oldest > g_done) mtl_wait_at(oldest, UINT64_MAX, WS_VIS); }
+    if (g_vis_ring[pick].buf) vis_fold(pick);
     g_vis_ring_i = pick; g_vis_ring[pick].fence = UINT64_MAX;
     if (!g_vis_ring[pick].buf) { g_vis_ring[pick].buf = [g_dev newBufferWithLength:VIS_SLOTS * 8 options:MTLResourceStorageModeShared]; res_add(g_vis_ring[pick].buf); }
     g_vis = g_vis_ring[pick].buf;
@@ -1863,7 +1878,7 @@ static void post_run(post_rec *r, uint64_t c0, uint64_t c1) {
     for (int i = 0; i < n; i++) {
         if (ops[i].kind == 1) { if (ops[i].mode == 1) *ops[i].val += ops[i].v; else *ops[i].val = ops[i].v; }
         else if (ops[i].kind == 3) {   // Samples passed: the sum of all slots since the reset
-            vis_list *l = ops[i].vis; uint64_t sum = 0;
+            vis_list *l = ops[i].vis; uint64_t sum = l->carry;
             for (int k = 0; k < l->n; k++) { sum += ((const uint64_t *)((__bridge id<MTLBuffer>)l->s[k].buf).contents)[l->s[k].slot]; CFRelease(l->s[k].buf); }
             free(l); uint64_t rec[2] = {sum, gpu_ticks()}; memcpy((void *)ops[i].addr, rec, sizeof rec);
         }
@@ -12322,7 +12337,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
                 if (g_vis_n >= VIS_SLOTS) RED_ONCE(35, "visibility slots exhausted");
                 else { g_vis_cur = (int)g_vis_n++; g_vis_cur_pass = g_pass.serial;
                     if (g_nvs == g_vscap) { g_vscap = g_vscap ? g_vscap * 2 : 64; g_vs = realloc_or_die(g_vs, g_vscap * sizeof *g_vs, "the visibility slots"); }
-                    g_vs[g_nvs++] = (vis_slot){(void *)CFBridgingRetain(g_vis), (uint32_t)g_vis_cur}; }
+                    g_vs[g_nvs++] = (vis_slot){(void *)CFBridgingRetain(g_vis), (uint32_t)g_vis_cur, g_vis_ring_i >= 0 && g_vis == g_vis_ring[g_vis_ring_i].buf ? g_vis_ring_i : -1}; }
             }
             if (g_vis_cur >= 0 && g_enc_vis != g_vis_cur + 1) { enc_r_visibility(en, MTLVisibilityResultModeCounting, (NSUInteger)g_vis_cur * 8); g_enc_vis = g_vis_cur + 1; }
         }
