@@ -250,10 +250,16 @@ static void res_remove(id<MTLAllocation> r) { @autoreleasepool {
 - (void)dealloc { res_remove(heap); atomic_fetch_sub(&g_image_heap_n, 1); }
 @end
 static char g_image_heap_owner_key;
-// The R32 storage under a 32-bit colour texture that takes image atomics (tex_upgrade): resident as long as the colour view over it lives, which is what the game's names hold
+// DM_NVN_UPGRADE_SAFE=0 (switch) restores the earlier retirement of a texture tex_upgrade replaces: the old one left the residency set one submission after the one being encoded,
+// the R32 storage under an atomic colour view left it at once when the view was freed, twin views of the old texture held by other serials were remade only lazily, and a later
+// upgrade of an atomic colour view upgraded its R32 storage as if the view were an sRGB / linear twin. DM_NVN_UPGRADE_KEEP=<n> submissions (default 8, at least 2) keeps the old one
+static int upg_safe(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_UPGRADE_SAFE"); v = !e || atoi(e); } return v; }
+static void defer_obj_release(id obj);
+// The R32 storage under a 32-bit colour texture that takes image atomics (tex_upgrade): resident as long as the colour view over it lives, which is what the game's names hold.
+// The view can go before the GPU is done with a submission that reached the storage through it (Metal 4 command buffers retain nothing): its residency goes through deferred release
 @interface NvAtomicRaw : NSObject { @public id<MTLTexture> raw; } @end
 @implementation NvAtomicRaw
-- (void)dealloc { res_remove(raw); }
+- (void)dealloc { if (upg_safe()) defer_obj_release(raw); else res_remove(raw); }
 @end
 static char g_atomic_raw_key;
 // DM_RES_CHECK=1 (diagnostic): if textures / buffers the shader accesses through the argument block are not in the residency set, print the first 40 (textures are attributed to the actual allocation via parent texture / underlying buffer)
@@ -339,14 +345,15 @@ static pthread_mutex_t g_deferred_mu = PTHREAD_MUTEX_INITIALIZER;
 //   defer_obj_unref   = only the reference I hold is no longer wanted, the object itself may still be in use (the view cache of a texture ID may hold the base texture itself): only drop the reference, leave the residency set alone.
 // Previously only the former existed: when the view cache was invalidated, a texture that 'is still the current storage of some serial' was also removed from the residency set. Invalidation used to happen only when the base texture was really replaced, so it was never hit;
 // after the transparency chain's in-place composite swapped the storage of two textures, each of the two live textures was removed once this way, and afterwards they are used as attachments and sampled every frame as usual - the GPU accesses non-resident memory.
-static void defer_obj_release_ex(id obj, int keep_resident) {
+static void defer_obj_release_at(id obj, int keep_resident, uint64_t fence) {
     if (!obj) return;
-    NvDeferredRelease *d = [NvDeferredRelease new]; d->object = obj; d->fence = g_fence + 2; d->keep_resident = keep_resident;   // one submission past the one being encoded (PR #1444 a15c0415)
+    NvDeferredRelease *d = [NvDeferredRelease new]; d->object = obj; d->fence = fence; d->keep_resident = keep_resident;
     pthread_mutex_lock(&g_deferred_mu);
     if (!g_deferred) g_deferred = [NSMutableArray array];
     [g_deferred addObject:d];
     pthread_mutex_unlock(&g_deferred_mu);
 }
+static void defer_obj_release_ex(id obj, int keep_resident) { defer_obj_release_at(obj, keep_resident, g_fence + 2); }   // one submission past the one being encoded (PR #1444 a15c0415)
 static void defer_obj_release(id obj) { defer_obj_release_ex(obj, 0); }
 static void defer_obj_unref(id obj) { defer_obj_release_ex(obj, 1); }
 // Its own autorelease pool: mtl_sub_begin drains before it pushes the submission's pool, on the guest submit thread, whose implicit pool is never drained. The weak-table lookups and the residency-set removal
@@ -2320,6 +2327,7 @@ static int tex_atomic_alias(id<MTLTexture> base) {
         || pf == MTLPixelFormatRG16Unorm || pf == MTLPixelFormatRG16Snorm || pf == MTLPixelFormatRG16Uint || pf == MTLPixelFormatRG16Sint || pf == MTLPixelFormatRG16Float || pf == MTLPixelFormatR32Float;
     return bytes32 && (base.textureType == MTLTextureType2D || base.textureType == MTLTextureType2DArray) && base.sampleCount == 1 && base.storageMode == MTLStorageModePrivate && !base.buffer && !base.isSparse;
 }
+static int mtl_fmt_block(MTLPixelFormat f);
 static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     uint32_t pf = 0; uint8_t swz[4];
     if (!nvn_fmt_to_mtl(t->d.format, &pf, swz) || !pf) { RED_ONCE(0, "texture format %#x has no Metal equivalent (first case)", t->d.format); return nil; }
@@ -2376,13 +2384,39 @@ static MTLTextureDescriptor *tex_desc(const tex_t *t, int packaged) {
     // Mansion 3), and upgrading later would recreate a depth buffer in use. Unlike colour formats it costs nothing measured: on an M4 Pro a 2560x1440 one has the same allocated size and the same
     // GPU time over eight load / store passes with and without it
     if (d.pixelFormat == MTLPixelFormatDepth32Float_Stencil8) d.usage |= MTLTextureUsagePixelFormatView;
+    // DM_NVN_TEX_WRITE_ALL=1 (diagnostic): every uncompressed, non-depth, single-sample 2D / 2D array texture the host makes from a description gets the format-view usage, and shader
+    // write (with atomics for R32Uint / R32Sint) where its format is writable, so no image bind or format view upgrades it later (tex_upgrade). It costs Apple GPUs' lossless compression
+    // on all of them (more memory bandwidth). Only a 32-bit colour texture taking image atomics still moves to R32 storage (DM_NVN_ATOMIC_ALIAS=0 leaves those atomics to a write sink)
+    static int wall = -1; if (wall < 0) { const char *e = getenv("DM_NVN_TEX_WRITE_ALL"); wall = e && atoi(e) > 0; if (wall) MLOG("DM_NVN_TEX_WRITE_ALL: textures made with shader-write and format-view usage from the start (no lossless compression)"); }
+    if (wall && !packaged && !fmt_compressed(t->d.format) && !fmt_depth(t->d.format) && d.sampleCount <= 1 && (d.textureType == MTLTextureType2D || d.textureType == MTLTextureType2DArray)) {
+        MTLPixelFormat pf = d.pixelFormat;
+        int srgb = pf == MTLPixelFormatR8Unorm_sRGB || pf == MTLPixelFormatRG8Unorm_sRGB || pf == MTLPixelFormatRGBA8Unorm_sRGB || pf == MTLPixelFormatBGRA8Unorm_sRGB
+                || pf == MTLPixelFormatBGR10_XR_sRGB || pf == MTLPixelFormatBGRA10_XR_sRGB;
+        int writable = !srgb && pf != MTLPixelFormatRGB9E5Float && !(pf >= MTLPixelFormatB5G6R5Unorm && pf <= MTLPixelFormatBGR5A1Unorm) && pf < MTLPixelFormatGBGR422 && !mtl_fmt_block(pf);
+        d.usage |= MTLTextureUsagePixelFormatView | (writable ? MTLTextureUsageShaderWrite | (pf_r32i(pf) ? MTLTextureUsageShaderAtomic : 0) : 0);
+    }
     return d;
 }
 // In-place upgrade: when the original texture was not created with PixelFormatView (off by default, to keep Apple GPU lossless compression) but a different-format view is needed, create a new one with the original spec + PixelFormatView, copy over every slice × level, and replace the registration.
 // Count: across the 4 screens character select / camp / wilderness / combat, 17473 textures needed a different-format view 0 times, so this is a fallback and does not rely on predicting which textures need it
 // The same upgrade adds render-target usage for a whole-level clear (clear_tex) of a texture made without it: Monster Hunter Rise clears a 32x80 packaged one
+static uint64_t upg_keep(void) { static uint64_t v; if (!v) { const char *e = getenv("DM_NVN_UPGRADE_KEEP"); v = e && atoll(e) > 2 ? (uint64_t)atoll(e) : e ? 2 : 8; } return upg_safe() ? v : 2; }
 static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextureUsage add, MTLPixelFormat view_pf) {
     id holder = tex_get(t->serial);
+    // A colour view over R32 storage (an earlier atomic upgrade, below) is not an sRGB / linear twin: taken for one, its R32 storage would be remade and retired while the view, which
+    // other serials and the sharing table hold, still reads it. The storage was made with every usage the original had plus shader write, atomics and format views
+    int over_raw = 0;   // the asked texture or the serial's is that view, or a view of it (a twin)
+    if (upg_safe()) {
+        for (id<MTLTexture> v = asked; v && !over_raw; v = v.parentTexture) over_raw = objc_getAssociatedObject(v, &g_atomic_raw_key) != nil;
+        if (![holder isKindOfClass:[NvPkg class]] && [holder conformsToProtocol:@protocol(MTLTexture)])
+            for (id<MTLTexture> v = holder; v && !over_raw; v = v.parentTexture) over_raw = objc_getAssociatedObject(v, &g_atomic_raw_key) != nil;
+    }
+    if (over_raw) {
+        id<MTLTexture> root = asked; while (root.parentTexture) root = root.parentTexture;
+        MTLTextureUsage miss = (add & ~(MTLTextureUsage)MTLTextureUsageShaderAtomic) & ~root.usage;
+        if (miss) RED_ONCE(155, "a colour view over R32 storage (image atomics) needs usage %#lx its storage lacks (ser=%llu format %lu): kept as it is", (unsigned long)miss, (unsigned long long)t->serial, (unsigned long)root.pixelFormat);
+        return asked;
+    }
     // The serial holds an sRGB / linear view (tex_mtl_) of the asked texture, or the asked texture is that view: the parent is upgraded and the view made again on it, so the pair keeps sharing its bytes
     id<MTLTexture> view = ![holder isKindOfClass:[NvPkg class]] && [holder conformsToProtocol:@protocol(MTLTexture)] && ((id<MTLTexture>)holder).parentTexture
         && (holder == asked || ((id<MTLTexture>)holder).parentTexture == asked) ? holder : nil;
@@ -2416,21 +2450,44 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
         else for (NSUInteger s = 0; s < slices; s++)
             enc_b_copy_texture(b, base, s, l, MTLOriginMake(0, 0, 0), MTLSizeMake(w, h, 1), upgraded, s, l, MTLOriginMake(0, 0, 0));
     }
-    if ([holder isKindOfClass:[NvPkg class]]) { id<MTLTexture> old = ((NvPkg *)holder)->tex; ((NvPkg *)holder)->tex = upgraded; defer_obj_release(old); g_ser_gen++;
+    if ([holder isKindOfClass:[NvPkg class]]) { id<MTLTexture> old = ((NvPkg *)holder)->tex; ((NvPkg *)holder)->tex = upgraded; defer_obj_release_at(old, 0, g_fence + upg_keep()); g_ser_gen++;
         if (((NvPkg *)holder)->view) { defer_obj_unref(((NvPkg *)holder)->view); ((NvPkg *)holder)->view = nil; ((NvPkg *)holder)->vbase = 0; } }   // a sparse texture's view of the old one: bound whole until its next upload
     else {
         // Every name of the old texture moves to the upgraded one: other serials sharing its storage (live in g_by_serial, finalized in g_ghost) and the sharing table. Only the asking serial moved before,
         // so the others kept reading the old copy while writes went to the new one, and the old texture stayed in g_alias_set. Slots are replaced in place (no insert, so no table resize during the walk);
         // the old texture is retired once the submissions that used it complete, the view caches follow g_ser_gen (PR #107)
+        // Views of the old texture other serials hold (an sRGB / linear twin, tex_mtl_) move too, remade on the upgraded one: left on the old texture they were remade only when their
+        // serial was next resolved (the stale check in tex_mtl_), and a cache that kept one past the old texture's retirement read storage out of the residency set
         pthread_mutex_lock(&g_smu);
-        nvn_hmap *tables[] = {&g_by_serial, &g_ghost}; int named = 0, shared = 0;
+        nvn_hmap *tables[] = {&g_by_serial, &g_ghost}; int named = 0, shared = 0, named_view = 0;
+        enum { TWINS = 8 }; __strong id<MTLTexture> tw_old[TWINS], tw_new[TWINS]; int ntw = 0;
         for (unsigned j = 0; j < 2; j++) for (uint32_t i = 0; i < tables[j]->cap; i++) {
-            if (tables[j]->vals[i] != (__bridge void *)base) continue;
+            void *cur = tables[j]->vals[i]; if (!cur) continue;
             uint64_t serial; memcpy(&serial, tables[j]->keys + (size_t)i * tables[j]->klen, sizeof serial);
-            void *old = tables[j]->vals[i]; tables[j]->vals[i] = (void *)CFBridgingRetain(upgraded);
-            if (j == 0) { held_add(old, -1); held_add((__bridge void *)upgraded, 1); }   // g_by_serial: the count moves with the name
-            CFRelease(old); named |= serial == t->serial;
+            if (cur == (__bridge void *)base) {
+                void *old = tables[j]->vals[i]; tables[j]->vals[i] = (void *)CFBridgingRetain(upgraded);
+                if (j == 0) { held_add(old, -1); held_add((__bridge void *)upgraded, 1); }   // g_by_serial: the count moves with the name
+                CFRelease(old); named |= serial == t->serial;
+                continue;
+            }
+            if (!upg_safe()) continue;
+            id o = (__bridge id)cur;
+            if (![o conformsToProtocol:@protocol(MTLTexture)] || ((id<MTLTexture>)o).parentTexture != base) continue;
+            id<MTLTexture> ov = o, nv = nil;
+            for (int k = 0; k < ntw && !nv; k++) if (tw_old[k] == ov) nv = tw_new[k];
+            if (!nv && ntw < TWINS) {
+                NSUInteger ns = ov.textureType == MTLTextureType3D ? 1 : ov.arrayLength * (ov.textureType == MTLTextureTypeCube || ov.textureType == MTLTextureTypeCubeArray ? 6 : 1);
+                nv = [upgraded newTextureViewWithPixelFormat:ov.pixelFormat textureType:ov.textureType levels:NSMakeRange(ov.parentRelativeLevel, ov.mipmapLevelCount)
+                                                      slices:NSMakeRange(ov.parentRelativeSlice, ns) swizzle:ov.swizzle];
+                if (nv) { tw_old[ntw] = ov; tw_new[ntw++] = nv; }
+            }
+            if (!nv) continue;   // kept on the old texture: tex_mtl_ remakes it when its serial is next resolved, as before
+            tables[j]->vals[i] = (void *)CFBridgingRetain(nv);
+            if (j == 0) { held_add(cur, -1); held_add((__bridge void *)nv, 1); }   // g_by_serial: the count moves with the name
+            defer_obj_unref(ov); CFRelease(cur);   // the old view stays alive until the submissions that may use it complete
+            named_view |= serial == t->serial && ov == view;
         }
+        if (ntw) { static int nl; if (nl++ < 4) MLOG("texture upgrade ser=%llu: %d view(s) of the old texture other names held made again on the upgraded one", (unsigned long long)t->serial, ntw); }
         for (uint32_t i = 0; i < g_alias.cap; i++) {
             if (g_alias.vals[i] != (__bridge void *)base) continue;
             void *old = g_alias.vals[i]; g_alias.vals[i] = (void *)CFBridgingRetain(upgraded); CFRelease(old); shared = 1;
@@ -2438,12 +2495,14 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
         if (shared) { CFSetRemoveValue(g_alias_set, (__bridge const void *)base); CFSetAddValue(g_alias_set, (__bridge const void *)upgraded); }
         g_ser_gen++;
         pthread_mutex_unlock(&g_smu);
-        if (view) {
+        if (view && named_view) {   // moved with the other names above
+            for (int k = 0; k < ntw; k++) if (tw_old[k] == view) upgraded_view = tw_new[k];
+        } else if (view) {
             id<MTLTexture> nv = [upgraded newTextureViewWithPixelFormat:view.pixelFormat textureType:view.textureType levels:NSMakeRange(0, upgraded.mipmapLevelCount) slices:NSMakeRange(0, upgraded.arrayLength) swizzle:view.swizzle];
             static int nview; if (nview++ < 4) MLOG("sRGB / linear view ser=%llu made again on its upgraded parent (%d so far)", (unsigned long long)t->serial, nview);
             if (nv) { tex_put(t->serial, nv); upgraded_view = nv; } else RED_ONCE(151, "cannot make the sRGB / linear view ser=%llu again on its upgraded parent: it keeps the old storage", (unsigned long long)t->serial);
         } else if (!named) tex_put(t->serial, upgraded);
-        defer_obj_release(base);
+        defer_obj_release_at(base, 0, g_fence + upg_keep());   // retired (out of the residency set) once the submissions encoded so far and the next ones have completed (DM_NVN_UPGRADE_KEEP)
     }
     MLOG("texture upgraded to allow %s ser=%llu base format %lu → view format %lu (upgrades=%llu)", add & MTLTextureUsageShaderWrite ? "image writes" : add & MTLTextureUsageRenderTarget ? "render-target use" : "format views", t->serial, (unsigned long)base.pixelFormat, (unsigned long)view_pf, ++g_pfv_upgrades);
     return upgraded_view ? upgraded_view : upgraded;
@@ -8790,6 +8849,9 @@ static id<MTLTexture> img_binding(int tid, const nvn_rbind *b, uint64_t *rid, in
 // An image bind may follow rendering into a texture created without IMAGE; upgrading it inside encode_args would
 // copy out of an attachment while its render pass was still open. Close that pass first, then replace the shared backing (all registered sampled views follow g_ser_gen).
 static uint32_t ubo_handle(int stage, int reg, int off); static int ubo_tex_id(uint32_t h);
+// DM_NVN_ATOMIC_ALIAS=0 (diagnostic): a 32-bit colour texture in an atomic image slot is not moved to R32 storage (tex_upgrade); its atomics go to the write sink (dummy_img_atomic), so
+// their results are lost (Ocarina of Time's NDSR upscaler output). With DM_NVN_TEX_WRITE_ALL=1 this leaves a run with no texture upgrade from image binds at all
+static int atomic_alias_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ATOMIC_ALIAS"); v = !e || atoi(e); } return v; }
 static void image_prepare(NvProg *pr, unsigned stages) {
     if (!pr) return;
     if (!pr->c_img) { int any = 0;   // no written or atomic image slot in any stage: nothing to resolve, every draw
@@ -8808,7 +8870,7 @@ static void image_prepare(NvProg *pr, unsigned stages) {
             // The actual image binding is image intent too: some engines write a descriptor with RegisterTexture and use its handle in an image slot.
             tex_t image = g_treg[tid].t; image.d.flags |= NVN_TEXTURE_FLAGS_IMAGE; mtl_tex_gpu_written(&image);
             id<MTLTexture> base = tex_mtl(&image); sparse_gpu_wrote(&image); while (base.parentTexture) base = base.parentTexture;
-            int reinterpret = b->atom && b->dpf != NVN_DPF_FLOAT && tex_atomic_alias(base);
+            int reinterpret = b->atom && b->dpf != NVN_DPF_FLOAT && atomic_alias_on() && tex_atomic_alias(base);
             int upgrade = base && (!(base.usage & MTLTextureUsageShaderWrite) || reinterpret);
             os_unfair_lock_unlock(&g_rmu);
             if (!upgrade) continue;
@@ -8818,7 +8880,7 @@ static void image_prepare(NvProg *pr, unsigned stages) {
             if (tid < g_ntreg && g_treg[tid].ok && !g_treg[tid].gone) {
                 image = g_treg[tid].t; image.d.flags |= NVN_TEXTURE_FLAGS_IMAGE;
                 base = tex_mtl(&image); while (base.parentTexture) base = base.parentTexture;
-                reinterpret = b->atom && b->dpf != NVN_DPF_FLOAT && tex_atomic_alias(base);
+                reinterpret = b->atom && b->dpf != NVN_DPF_FLOAT && atomic_alias_on() && tex_atomic_alias(base);
                 if (base && (!(base.usage & MTLTextureUsageShaderWrite) || reinterpret)) {
                     if (reinterpret) tex_upgrade(&image, base, img_usage(&image, base.pixelFormat) | MTLTextureUsageShaderAtomic, b->dpf == NVN_DPF_UINT ? MTLPixelFormatR32Uint : MTLPixelFormatR32Sint);
                     else tex_upgrade(&image, base, img_usage(&image, base.pixelFormat), base.pixelFormat);
